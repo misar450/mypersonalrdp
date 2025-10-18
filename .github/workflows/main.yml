@@ -86,31 +86,26 @@ jobs:
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Force Tailscale MTU to 1400 (Windows)
-        shell: pwsh
+      - name: Set MTU 1400 on Tailscale (netsh) and verify
         run: |
-          # Find the Tailscale adapter
-          $adapter = Get-NetAdapter | Where-Object {
-            $_.InterfaceDescription -like "Tailscale Tunnel*" -or $_.Name -eq "Tailscale"
-          } | Select-Object -First 1
-
-          if (-not $adapter) {
-            Write-Error "Tailscale adapter not found."
+          # Ensure the "Tailscale" interface exists before applying MTU
+          $iface = Get-NetIPInterface -InterfaceAlias "Tailscale" -ErrorAction SilentlyContinue
+          if (-not $iface) {
+            Write-Error "Interface 'Tailscale' not found."
             exit 1
           }
 
-          $alias = $adapter.Name
+          # Set MTU via netsh (persistent) for IPv4 and IPv6
+          netsh interface ipv4 set subinterface "Tailscale" mtu=1400 store=persistent
+          netsh interface ipv6 set subinterface "Tailscale" mtu=1400 store=persistent
 
-          # Set MTU for IPv4 (persistent) and IPv6
-          netsh interface ipv4 set subinterface name="$alias" mtu=1400 store=persistent | Out-Null
-          netsh interface ipv6 set subinterface name="$alias" mtu=1400 | Out-Null
+          # Verify using a table of all interfaces
+          Get-NetIPInterface | Format-Table InterfaceAlias, AddressFamily, NlMtu, ConnectionState -Auto
 
-          # Verify
-          $v4 = Get-NetIPInterface -InterfaceAlias $alias -AddressFamily IPv4
-          $v6 = Get-NetIPInterface -InterfaceAlias $alias -AddressFamily IPv6
-          Write-Host "Applied MTU (IPv4): $($v4.NlMtu) on '$alias'"
-          Write-Host "Applied MTU (IPv6): $($v6.NlMtu) on '$alias'"
-
+          # Verify specific values on the Tailscale interface
+          Get-NetIPInterface -InterfaceAlias "Tailscale" -AddressFamily IPv4 | Select-Object InterfaceAlias, NlMtu
+          Get-NetIPInterface -InterfaceAlias "Tailscale" -AddressFamily IPv6 | Select-Object InterfaceAlias, NlMtu
+      
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
