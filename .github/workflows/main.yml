@@ -48,11 +48,11 @@ jobs:
               exit 1
           }
 
-       - name: Install Microsoft OpenJDK 21
-         run: |
-           # Update sources and install OpenJDK 21
-           winget source update
-           winget install --id=Microsoft.OpenJDK.21 -e --accept-package-agreements --accept-source-agreements --silent --scope machine
+      - name: Install Microsoft OpenJDK 21
+        run: |
+          # Update sources and install OpenJDK 21
+          winget source update
+          winget install --id=Microsoft.OpenJDK.21 -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
       - name: Install Tailscale
         run: |
