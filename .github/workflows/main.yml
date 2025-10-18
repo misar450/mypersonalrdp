@@ -85,7 +85,32 @@ jobs:
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
+
+      - name: Force Tailscale MTU to 1400 (Windows)
+        shell: pwsh
+        run: |
+          # Find the Tailscale adapter
+          $adapter = Get-NetAdapter | Where-Object {
+            $_.InterfaceDescription -like "Tailscale Tunnel*" -or $_.Name -eq "Tailscale"
+          } | Select-Object -First 1
+
+          if (-not $adapter) {
+            Write-Error "Tailscale adapter not found."
+            exit 1
+          }
+
+          $alias = $adapter.Name
+
+          # Set MTU for IPv4 (persistent) and IPv6
+          netsh interface ipv4 set subinterface name="$alias" mtu=1400 store=persistent | Out-Null
+          netsh interface ipv6 set subinterface name="$alias" mtu=1400 | Out-Null
+
+          # Verify
+          $v4 = Get-NetIPInterface -InterfaceAlias $alias -AddressFamily IPv4
+          $v6 = Get-NetIPInterface -InterfaceAlias $alias -AddressFamily IPv6
+          Write-Host "Applied MTU (IPv4): $($v4.NlMtu) on '$alias'"
+          Write-Host "Applied MTU (IPv6): $($v6.NlMtu) on '$alias'"
+
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
