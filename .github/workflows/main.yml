@@ -99,9 +99,6 @@ jobs:
           netsh interface ipv4 set subinterface "Tailscale" mtu=1400 store=persistent
           netsh interface ipv6 set subinterface "Tailscale" mtu=1400 store=persistent
 
-          # Verify using a table of all interfaces
-          Get-NetIPInterface | Format-Table InterfaceAlias, AddressFamily, NlMtu, ConnectionState -Auto
-
           # Verify specific values on the Tailscale interface
           Get-NetIPInterface -InterfaceAlias "Tailscale" -AddressFamily IPv4 | Select-Object InterfaceAlias, NlMtu
           Get-NetIPInterface -InterfaceAlias "Tailscale" -AddressFamily IPv6 | Select-Object InterfaceAlias, NlMtu
