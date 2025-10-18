@@ -1,95 +1,144 @@
-name: SSH Ubuntu
+name: RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  secure-ssh:
-    runs-on: ubuntu-latest
-    timeout-minutes: 3600  # Max 60 hours; adjust as needed, but respect GitHub limits
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-      - name: Install and Configure SSH Server
+      - name: Configure Core RDP Settings
+        shell: powershell
         run: |
-          # Update packages and install OpenSSH server
-          sudo apt-get update -y
-          sudo apt-get install -y openssh-server
-          
-          # Enable SSH service and allow password authentication
-          sudo systemctl enable ssh
-          sudo systemctl start ssh
-          echo "PasswordAuthentication yes" | sudo tee -a /etc/ssh/sshd_config
-          sudo systemctl restart ssh
-          
-          # Configure firewall to allow SSH (port 22) from anywhere for testing
-          sudo ufw allow 22/tcp || true  # '|| true' to handle if UFW isn't installed/enabled
-          sudo ufw reload || true
+          # Enable Remote Desktop. Network Level Authentication is disabled here for simplicity;
+          # consider enabling NLA for stronger security in production.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                            -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Create SSH User with Secure Password
+          # Replace any prior firewall rule and allow inbound 3389 only from Tailscale's IPv4 space (100.64.0.0/10).
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+
+          # Restart the Remote Desktop service to ensure settings apply.
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        shell: powershell
         run: |
-          # Generate a random secure password
-          PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9!@#$%^&*()_+' | head -c 16)
-          
-          # Create the user and set password
-          sudo useradd -m -s /bin/bash sshuser
-          echo "sshuser:$PASSWORD" | sudo chpasswd
-          sudo usermod -aG sudo sshuser  # Add to sudo group for admin access
-          
-          # Output credentials to env (for later display)
-          echo "SSH_CREDS=User: sshuser | Password: $PASSWORD" >> $GITHUB_ENV
-          
-          # Verify user creation
-          if ! id -u sshuser > /dev/null 2>&1; then
-            echo "User creation failed"
+          # Generate a strong random password and create/update the local "RDP" user.
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper   | Get-Random -Count 4
+          $rawPassword += $charSet.Lower   | Get-Random -Count 4
+          $rawPassword += $charSet.Number  | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password   = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          } else {
+            Set-LocalUser -Name "RDP" -Password $securePass
+          }
+
+          # Add the user to local admin and RDP groups.
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          # Publish credentials to the GitHub Actions environment.
+          "RDP_CREDS=User: RDP | Password: $password" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+            Write-Error "User creation failed"
             exit 1
-          fi
+          }
 
       - name: Install Tailscale
+        shell: powershell
         run: |
-          # Install Tailscale on Ubuntu
-          curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale version  # Verify installation
+          # Install a known-stable Tailscale MSI. Update $tsVersion if needed.
+          $tsVersion = "1.88.3"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-$tsVersion-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale-$tsVersion.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Set TS_DEBUG_MTU=1400 (envknob) and restart Tailscale service
+        shell: powershell
+        run: |
+          # Tailscale on Windows reads envknobs from %ProgramData%\Tailscale\tailscaled-env.txt.
+          # We set TS_DEBUG_MTU=1400 to adjust the tunnel MTU before "tailscale up", then restart the service.
+          $envDir  = "C:\ProgramData\Tailscale"
+          $envFile = Join-Path $envDir "tailscaled-env.txt"
+          New-Item -ItemType Directory -Force -Path $envDir | Out-Null
+          Set-Content -Path $envFile -Value "TS_DEBUG_MTU=1400`r`n"
+
+          # Restart the Windows service so the daemon picks up the envknob.
+          net stop Tailscale
+          net start Tailscale
 
       - name: Establish Tailscale Connection
+        shell: powershell
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
-          TS_IP=""
-          RETRIES=0
-          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
-            TS_IP=$(tailscale ip -4)
-            sleep 5
-            RETRIES=$((RETRIES+1))
-          done
-          
-          if [ -z "$TS_IP" ]; then
-            echo "Tailscale IP not assigned. Exiting."
-            exit 1
-          fi
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          # Bring the node up with your auth key and a unique hostname that includes the GitHub run ID.
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
 
-      - name: Verify SSH Accessibility
-        run: |
-          echo "Tailscale IP: $TAILSCALE_IP"
-          
-          # Test SSH port 22 over Tailscale IP (using nc for a simple TCP check)
-          if ! nc -zv $TAILSCALE_IP 22; then
-            echo "SSH port 22 connectivity test failed"
-            exit 1
-          fi
-          echo "SSH connectivity successful!"
+          # Wait for a Tailscale IPv4 address to be assigned (up to ~50 seconds).
+          $tsIP = $null; $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Maintain Connection
+      - name: Verify effective MTU and RDP accessibility
+        shell: powershell
         run: |
-          echo -e "\n=== SSH ACCESS ==="
-          echo "Address: $TAILSCALE_IP (connect via Tailscale network)"
-          echo "$SSH_CREDS"
-          echo "==================\n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
-          while true; do
-            echo "[$(date)] SSH Active - Use Ctrl+C in workflow to terminate or cancel in GitHub UI"
-            sleep 300
-          done
+          # Show the MTU Windows reports on the Tailscale adapter (informational).
+          $adapter = Get-NetAdapter -IncludeHidden |
+            Where-Object { $_.InterfaceDescription -like "*Tailscale*" -or $_.Name -like "*Tailscale*" } |
+            Select-Object -First 1
+          if ($adapter) {
+            Get-NetIPInterface -InterfaceIndex $adapter.ifIndex |
+              Select-Object InterfaceAlias,AddressFamily,NlMtu | Format-Table -AutoSize
+          } else {
+            Write-Warning "Could not find a Tailscale adapter to display MTU."
+          }
+
+          # Verify TCP reachability to 3389 via the Tailscale IP.
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "TCP connection to RDP port 3389 failed"
+            exit 1
+          }
+          Write-Host "TCP connectivity to 3389 over Tailscale is OK."
+
+      - name: Keep the session alive
+        shell: powershell
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host $env:RDP_CREDS
+          Write-Host "==================`n"
+          # Keep the runner alive until the workflow is manually canceled.
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active - press Cancel workflow to terminate"
+            Start-Sleep -Seconds 300
+          }
