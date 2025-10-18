@@ -48,6 +48,12 @@ jobs:
               exit 1
           }
 
+       - name: Install Microsoft OpenJDK 21
+         run: |
+           # Update sources and install OpenJDK 21
+           winget source update
+           winget install --id=Microsoft.OpenJDK.21 -e --accept-package-agreements --accept-source-agreements --silent --scope machine
+
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
@@ -57,16 +63,10 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Install Microsoft OpenJDK 21 (winget, non-interactive)
-        run: |
-          # Update sources and install OpenJDK 21 silently and non-interactively
-          winget source update
-          winget install --id=Microsoft.OpenJDK.21 -e --accept-package-agreements --accept-source-agreements --silent --scope machine
-
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # Bring up Tailscale with the provided auth key
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner
           
           # Wait for Tailscale to assign an IP
           $tsIP = $null
