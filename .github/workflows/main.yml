@@ -48,11 +48,11 @@ jobs:
               exit 1
           }
 
-      - name: Prime RDP user session locally (headless)
+      - name: Prime and maintain active RDP session
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          # Relax client certificate/auth prompts for mstsc
+          # Relaja las comprobaciones de autenticación del cliente RDP, necesario para la automatización.
           New-Item -Path 'HKCU:\Software\Microsoft\Terminal Server Client' -Force | Out-Null
           New-ItemProperty -Path 'HKCU:\Software\Microsoft\Terminal Server Client' -Name 'AuthenticationLevelOverride' -PropertyType DWord -Value 0 -Force | Out-Null
 
@@ -60,25 +60,28 @@ jobs:
           $user   = "RDP"
           $pass   = $env:RDP_PASSWORD
 
-          # Store credentials (avoid -NoNewWindow with -WindowStyle)
+          # Almacena las credenciales temporalmente para que mstsc no pida contraseña.
           Start-Process -FilePath "$env:SystemRoot\System32\cmdkey.exe" `
                         -ArgumentList @("/generic:$target","/user:$user","/pass:$pass") `
                         -WindowStyle Hidden -Wait
 
-          # Launch mstsc to localhost in background (hidden window)
+          # Lanza el cliente RDP (mstsc.exe) para conectarse a localhost.
+          # Lo ejecutamos en una ventana oculta y no lo cerramos. Esto mantendrá la sesión ACTIVA.
+          # Se añade el argumento /f (fullscreen) para asegurar que el escritorio se renderiza completamente.
           $mstsc = Join-Path $env:SystemRoot "System32\mstsc.exe"
-          $p = Start-Process -FilePath $mstsc -ArgumentList @("/v:127.0.0.1") -WindowStyle Hidden -PassThru
+          Start-Process -FilePath $mstsc -ArgumentList @("/v:127.0.0.1", "/f") -WindowStyle Hidden
 
-          # Give it a few seconds to complete the logon handshake, then close mstsc
-          Start-Sleep -Seconds 12
-          try { if (-not $p.HasExited) { $p.Kill() } } catch {}
+          # Damos tiempo suficiente (15 segundos) para que la sesión se inicie completamente
+          # y el escritorio (explorer.exe) se cargue en segundo plano.
+          Write-Host "Waiting for the local RDP session to fully initialize..."
+          Start-Sleep -Seconds 15
 
-          # Clean up stored credentials
+          # Limpiamos las credenciales almacenadas por seguridad. El proceso mstsc ya las ha utilizado.
           Start-Process -FilePath "$env:SystemRoot\System32\cmdkey.exe" `
                         -ArgumentList @("/delete:$target") `
                         -WindowStyle Hidden -Wait
 
-          Write-Host "RDP session for user 'RDP' has been started locally."
+          Write-Host "RDP session for user 'RDP' has been started and is being held active."```
 
       - name: Install Microsoft OpenJDK 21
         run: |
