@@ -9,7 +9,7 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Configure core RDP settings
         run: |
           # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
@@ -29,7 +29,7 @@ jobs:
           # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+      - name: Create RDP user
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
@@ -47,6 +47,23 @@ jobs:
               Write-Error "User creation failed"
               exit 1
           }
+      - name: Enable Autologon for RDP user
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # Configure Windows AutoAdminLogon for user 'RDP'
+          # Note: This stores the password in plaintext under Winlogon. Suitable for ephemeral CI runners.
+          $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+          $user     = 'RDP'
+          $pass     = $env:RDP_PASSWORD
+          $domain   = $env:COMPUTERNAME
+
+          New-ItemProperty -Path $winlogon -Name 'AutoAdminLogon'   -Value '1'        -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path $winlogon -Name 'DefaultUserName'  -Value $user      -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path $winlogon -Name 'DefaultPassword'  -Value $pass      -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path $winlogon -Name 'DefaultDomainName'-Value $domain    -PropertyType String -Force | Out-Null
+          New-ItemProperty -Path $winlogon -Name 'ForceAutoLogon'   -Value '1'        -PropertyType String -Force | Out-Null
+          Write-Host "Autologon configured for user 'RDP'."
 
       - name: Install Microsoft OpenJDK 21
         run: |
@@ -63,7 +80,7 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection
+      - name: Establish Tailscale connection
         run: |
           # Bring up Tailscale with the provided auth key
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner
@@ -83,7 +100,7 @@ jobs:
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Set MTU 1400 on Tailscale (netsh) and verify
+      - name: Set MTU 1400 on Tailscale and verify
         run: |
           # Ensure the "Tailscale" interface exists before applying MTU
           $iface = Get-NetIPInterface -InterfaceAlias "Tailscale" -ErrorAction SilentlyContinue
@@ -109,7 +126,7 @@ jobs:
 
           Write-Host "MTU successfully set to 1400 on 'Tailscale' (IPv4 and IPv6)."
 
-      - name: Verify RDP Accessibility
+      - name: Verify RDP accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
@@ -121,7 +138,7 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection
+      - name: Maintain connection
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
