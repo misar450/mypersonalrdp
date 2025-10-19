@@ -18,8 +18,6 @@ jobs:
                              -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
-          # Ensure a single session per user so RDP reconnects to the existing session
-          New-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fSingleSessionPerUser' -PropertyType DWord -Value 1 -Force | Out-Null
 
           # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
@@ -50,15 +48,10 @@ jobs:
               exit 1
           }
 
-      - name: Prime RDP user session locally
+      - name: Prime RDP user session locally (headless)
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          # Goal: create an interactive RDP session for user 'RDP' without reboot,
-          # so when you connect over Tailscale you attach to the existing session.
-          # Approach: save credentials for TERMSRV/127.0.0.1, relax client auth prompts,
-          # then start mstsc to localhost hidden, wait, and close it.
-
           # Relax client certificate/auth prompts for mstsc
           New-Item -Path 'HKCU:\Software\Microsoft\Terminal Server Client' -Force | Out-Null
           New-ItemProperty -Path 'HKCU:\Software\Microsoft\Terminal Server Client' -Name 'AuthenticationLevelOverride' -PropertyType DWord -Value 0 -Force | Out-Null
@@ -67,23 +60,23 @@ jobs:
           $user   = "RDP"
           $pass   = $env:RDP_PASSWORD
 
-          # Store credentials (hidden; not printed)
+          # Store credentials (avoid -NoNewWindow with -WindowStyle)
           Start-Process -FilePath "$env:SystemRoot\System32\cmdkey.exe" `
                         -ArgumentList @("/generic:$target","/user:$user","/pass:$pass") `
-                        -WindowStyle Hidden -NoNewWindow -Wait
+                        -WindowStyle Hidden -Wait
 
           # Launch mstsc to localhost in background (hidden window)
           $mstsc = Join-Path $env:SystemRoot "System32\mstsc.exe"
-          Start-Process -FilePath $mstsc -ArgumentList @("/v:127.0.0.1") -WindowStyle Hidden
+          $p = Start-Process -FilePath $mstsc -ArgumentList @("/v:127.0.0.1") -WindowStyle Hidden -PassThru
 
           # Give it a few seconds to complete the logon handshake, then close mstsc
           Start-Sleep -Seconds 12
-          Get-Process mstsc -ErrorAction SilentlyContinue | Stop-Process -Force
+          try { if (-not $p.HasExited) { $p.Kill() } } catch {}
 
           # Clean up stored credentials
           Start-Process -FilePath "$env:SystemRoot\System32\cmdkey.exe" `
                         -ArgumentList @("/delete:$target") `
-                        -WindowStyle Hidden -NoNewWindow -Wait
+                        -WindowStyle Hidden -Wait
 
           Write-Host "RDP session for user 'RDP' has been started locally."
 
@@ -93,35 +86,37 @@ jobs:
           winget source update
           winget install --id=Microsoft.OpenJDK.21 -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
-#      - name: Install rclone
-#        run: |
-#          # Install rclone via winget
-#          winget source update
-#          winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
-#
-#      - name: Configure rclone remote (Cloudflare R2)
-#        env:
-#          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
-#          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
-#          CF_R2_ACCESS_KEY_SECRET: ${{ secrets.CF_R2_ACCESS_KEY_SECRET }}
-#        run: |
-#          # Create rclone remote named 'persist' for Cloudflare R2 (S3-compatible)
-#          rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
-#          rclone config show persist | Out-Null
-
-      - name: Pull persistent folder from Cloudflare R2
-        env:
-          CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
-          PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
-        run: |
-          # Sync from R2 -> C:\persist
-          $persist = "C:\persist"
-          if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
-          New-Item -ItemType Directory -Force -Path $persist | Out-Null
-          # Ensure destination exists on R2 (no-op if it already exists)
-          rclone mkdir "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX"
-          rclone sync "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX" "$persist" --fast-list --checkers 16 --transfers 8
-          Write-Host "Persistent folder pulled to $persist."
+      # --- Cloudflare R2 + rclone (temporarily disabled) ---
+      # - name: Install rclone (non-interactive)
+      #   run: |
+      #     # Install rclone via winget
+      #     winget source update
+      #     winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
+      #
+      # - name: Configure rclone remote (Cloudflare R2)
+      #   env:
+      #     CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+      #     CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+      #     CF_R2_ACCESS_KEY_SECRET: ${{ secrets.CF_R2_ACCESS_KEY_SECRET }}
+      #   run: |
+      #     # Create rclone remote named 'persist' for Cloudflare R2 (S3-compatible)
+      #     rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
+      #     rclone config show persist | Out-Null
+      #
+      # - name: Pull persistent folder from Cloudflare R2
+      #   env:
+      #     CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
+      #     PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
+      #   run: |
+      #     # Sync from R2 -> C:\persist
+      #     $persist = "C:\persist"
+      #     if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
+      #     New-Item -ItemType Directory -Force -Path $persist | Out-Null
+      #     # Ensure destination exists on R2 (no-op if it already exists)
+      #     rclone mkdir "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX"
+      #     rclone sync "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX" "$persist" --fast-list --checkers 16 --transfers 8
+      #     Write-Host "Persistent folder pulled to $persist."
+      # --- End Cloudflare R2 + rclone (temporarily disabled) ---
 
       - name: Install Tailscale
         run: |
@@ -190,27 +185,29 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Start background sync to Cloudflare R2
-        env:
-          CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
-          PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
-        run: |
-          # Start a background process to periodically sync C:\persist -> R2 every 10 minutes
-          $persist = "C:\persist"
-          if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
-          $cmd = "$persist\_r2sync.ps1"
-          @"
-          while ($true) {
-            try {
-              rclone sync `"$persist`" `"persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX`" --fast-list --checkers 8 --transfers 4 | Out-File -FilePath `"$persist\_r2sync.log`" -Append
-            } catch {
-              "`$($_.Exception.Message)" | Out-File -FilePath `"$persist\_r2sync.log`" -Append
-            }
-            Start-Sleep -Seconds 600
-          }
-          "@ | Set-Content -Path $cmd -Encoding UTF8
-          Start-Process -FilePath "$PSHOME\pwsh.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$cmd) -WindowStyle Hidden
-          Write-Host "Started background sync task for C:\persist."
+      # --- Cloudflare R2 background sync (temporarily disabled) ---
+      # - name: Start background sync to Cloudflare R2
+      #   env:
+      #     CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
+      #     PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
+      #   run: |
+      #     # Start a background process to periodically sync C:\persist -> R2 every 10 minutes
+      #     $persist = "C:\persist"
+      #     if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
+      #     $cmd = "$persist\_r2sync.ps1"
+      #     @"
+      #     while ($true) {
+      #       try {
+      #         rclone sync `"$persist`" `"persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX`" --fast-list --checkers 8 --transfers 4 | Out-File -FilePath `"$persist\_r2sync.log`" -Append
+      #       } catch {
+      #         "`$($_.Exception.Message)" | Out-File -FilePath `"$persist\_r2sync.log`" -Append
+      #       }
+      #       Start-Sleep -Seconds 600
+      #     }
+      #     "@ | Set-Content -Path $cmd -Encoding UTF8
+      #     Start-Process -FilePath "$PSHOME\pwsh.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$cmd) -WindowStyle Hidden
+      #     Write-Host "Started background sync task for C:\persist."
+      # --- End Cloudflare R2 background sync (temporarily disabled) ---
 
       - name: Maintain connection
         run: |
