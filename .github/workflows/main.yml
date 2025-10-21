@@ -48,6 +48,26 @@ jobs:
               exit 1
           }
 
+      - name: Register Goreman autostart via HKLM Run (Procfile.gui)
+        run: |
+          # Download goreman and place it under C:\persist
+          $zipUrl = "https://github.com/mattn/goreman/releases/download/v0.3.16/goreman_v0.3.16_windows_amd64.zip"
+          $zip    = "$env:TEMP\goreman.zip"
+          $tmp    = "$env:TEMP\goreman"
+          $dest   = "C:\persist"
+          $exe    = Join-Path $dest "goreman.exe"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Invoke-WebRequest -Uri $zipUrl -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $tmp -Force
+          Copy-Item "$tmp\goreman.exe" $exe -Force
+
+          # Set HKLM Run so any interactive logon launches goreman with Procfile.gui
+          $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
+          if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }
+          $cmd = "`"$exe`" -f `"C:\persist\orchestrator\Procfile.gui`" start"
+          New-ItemProperty -Path $runKey -Name "GuiAppLauncher" -PropertyType String -Value $cmd -Force | Out-Null
+          Write-Host "Configured HKLM Run to start goreman with Procfile.gui (if present)."
+
       - name: Prime and maintain active RDP session
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -81,7 +101,7 @@ jobs:
                         -ArgumentList @("/delete:$target") `
                         -WindowStyle Hidden -Wait
 
-          Write-Host "RDP session for user 'RDP' has been started and is being held active."```
+          Write-Host "RDP session for user 'RDP' has been started and is being held active."
 
       - name: Install Microsoft OpenJDK 21
         run: |
@@ -175,6 +195,80 @@ jobs:
           }
 
           Write-Host "MTU successfully set to 1400 on 'Tailscale' (IPv4 and IPv6)."
+
+      - name: Install and start WinSW orchestrator (single YAML, run as RDP)
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # Layout:
+          #   C:\persist\orchestrator\orchestrator.yaml   (WinSW config: single service)
+          #   C:\persist\orchestrator\Procfile.gui        (used by goreman at user logon)
+          #   C:\persist\svc-logs                         (service logs)
+          #
+          # This step:
+          #   - Downloads WinSW x64 and renames to orchestrator.exe (single instance)
+          #   - Installs service 'orchestrator'
+          #   - Runs service under .\RDP using RDP_PASSWORD (stored in SCM)
+          #   - Grants 'Log on as a service' to RDP, preserving existing assignments
+          #   - Starts the service
+
+          $orchDir = "C:\persist\orchestrator"
+          $logsDir = "C:\persist\svc-logs"
+          New-Item -ItemType Directory -Force -Path $orchDir, $logsDir | Out-Null
+
+          $yaml = Join-Path $orchDir "orchestrator.yaml"
+          if (-not (Test-Path $yaml)) {
+            Write-Host "No orchestrator.yaml found at $orchDir. Skipping WinSW install."
+            exit 0
+          }
+
+          # Download latest WinSW x64
+          $exe  = Join-Path $orchDir "orchestrator.exe"
+          $rel  = Invoke-RestMethod -Uri "https://api.github.com/repos/winsw/winsw/releases/latest" -Headers @{ "User-Agent"="curl/8.0" }
+          $asset= $rel.assets | Where-Object { $_.name -match "(?i)winsw.*x64\.exe$" } | Select-Object -First 1
+          if (-not $asset) { throw "WinSW x64 asset not found." }
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $exe
+
+          # Install service (id defaults to exe base if not specified in YAML; recommend id: orchestrator)
+          & $exe stop      | Out-Null 2>$null
+          & $exe uninstall | Out-Null 2>$null
+          & $exe install
+
+          # Configure service to run as .\RDP with secret password (kept by SCM, not in YAML)
+          sc.exe config orchestrator obj= ".\RDP" password= "$env:RDP_PASSWORD" | Out-Null
+
+          # Grant 'Log on as a service' to RDP, preserving existing entries
+          $export = Join-Path $env:TEMP "secpol_export.inf"
+          secedit /export /cfg "$export" /areas USER_RIGHTS | Out-Null
+
+          $lines = Get-Content "$export"
+          $idx = ($lines | Select-String -Pattern '^\s*SeServiceLogonRight\s*=' -List).LineNumber
+          $current = ""
+          if ($idx) {
+            $current = ($lines[$idx-1] -replace '^\s*SeServiceLogonRight\s*=\s*','').Trim()
+          }
+          $vals = @()
+          if ($current) { $vals = ($current -split '\s*,\s*') | Where-Object { $_ -ne '' } }
+          $acct = "$env:COMPUTERNAME\RDP"
+          if ($vals -notcontains $acct) { $vals += $acct }
+
+          $inf = @"
+          [Unicode]
+          Unicode=yes
+          [Version]
+          signature="$CHICAGO$"
+          Revision=1
+          [Privilege Rights]
+          SeServiceLogonRight = $(($vals -join ','))
+          "@
+          $grant = Join-Path $env:TEMP "grant_service_logon.inf"
+          $db    = Join-Path $env:TEMP "secedit.sdb"
+          $inf | Set-Content -Path $grant -Encoding ASCII
+          secedit /configure /db "$db" /cfg "$grant" /areas USER_RIGHTS | Out-Null
+
+          # Start the service
+          sc.exe start orchestrator | Out-Null
+          Write-Host "WinSW orchestrator service installed and started as .\RDP."
 
       - name: Verify RDP accessibility
         run: |
