@@ -80,7 +80,7 @@ jobs:
       - name: Install WinFSP for Rclone mounting
         run: |
           winget source update
-          winget install --id=SchoonmakerProductionsLLC.WinFSP -e --accept-package-agreements --accept-source-agreements --silent --scope machine
+          winget install --id=WinFsp.WinFsp -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
       - name: Set up Rclone mount as a background daemon service
         env:
