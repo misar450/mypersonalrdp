@@ -61,10 +61,10 @@ jobs:
           rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
           rclone config show persist | Out-Null
 
-      - name: Install WinFSP for Rclone mounting
+      - name: Install WinFsp for Rclone mounting
         run: |
           winget source update
-          winget install --id=WinFSP.WinFSP -e --accept-package-agreements --accept-source-agreements --silent --scope machine
+          winget install --id=WinFsp.WinFsp -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
       - name: Set up Rclone mount as a background daemon service
         env:
