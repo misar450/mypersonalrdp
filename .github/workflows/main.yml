@@ -30,14 +30,10 @@ jobs:
         run: |
           $ua = @{ "User-Agent"="curl/8.0" }
           New-Item -ItemType Directory -Force -Path "C:\tools\winsw","C:\tools\goreman","C:\persist\orchestrator" | Out-Null
-
-          # WinSW latest x64
           $winswRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/winsw/winsw/releases/latest" -Headers $ua
           $winswAsset = $winswRel.assets | Where-Object { $_.name -match "(?i)winsw.*x64\.exe$" } | Select-Object -First 1
           if (-not $winswAsset) { throw "WinSW x64 asset not found." }
           Invoke-WebRequest -Uri $winswAsset.browser_download_url -OutFile "C:\tools\winsw\winsw.exe"
-
-          # Goreman latest windows_amd64.zip
           $gRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/mattn/goreman/releases/latest" -Headers $ua
           $gZip   = $gRel.assets | Where-Object { $_.name -match "(?i)windows_amd64\.zip$" } | Select-Object -First 1
           if (-not $gZip) { throw "Goreman windows_amd64.zip asset not found." }
@@ -65,58 +61,52 @@ jobs:
           rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
           rclone config show persist | Out-Null
 
-      - name: Pull persistent folder from Cloudflare R2
-        env:
-          CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
-          PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
-        run: |
-          $persist = "C:\persist"
-          if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
-          New-Item -ItemType Directory -Force -Path $persist | Out-Null
-          rclone mkdir "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX"
-          rclone sync "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX" "$persist" --fast-list --checkers 16 --transfers 8
-          Write-Host "Persistent folder pulled to $persist."
-
       - name: Install WinFSP for Rclone mounting
         run: |
           winget source update
-          winget install --id=WinFsp.WinFsp -e --accept-package-agreements --accept-source-agreements --silent --scope machine
+          winget install --id=WinFSP.WinFSP -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
       - name: Set up Rclone mount as a background daemon service
         env:
           CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
           PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
+        shell: pwsh
         run: |
           $mountDir = "C:\tools\rclone-mount"
-          New-Item -ItemType Directory -Force -Path $mountDir | Out-Null
-
-          # Create WinSW config for Rclone mount service
+          New-Item -ItemType Directory -Force -Path "$mountDir\cache" | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\persist" | Out-Null
+          $rcloneConfig = rclone config file | Out-String | ForEach-Object { $_.Trim() }
+          $rcloneArguments = "mount `"persist:$($env:CF_R2_BUCKET)/$($env:PERSIST_PREFIX)`" C:\persist --config `"$rcloneConfig`" --vfs-cache-mode full --dir-cache-time 5m --cache-dir `"$mountDir\cache`" --file-perms 0777 --network-mode --no-console --log-level INFO --log-file `"$mountDir\mount.log`""
           $winswConfig = @"
           <service>
             <id>rclone-persist-mount</id>
             <name>Rclone Persist Mount (R2 Daemon)</name>
-            <description>Background daemon mounting Cloudflare R2 at C:\persist for real-time sync of changes</description>
+            <description>Background daemon mounting Cloudflare R2 at C:\persist</description>
             <executable>rclone.exe</executable>
-            <arguments>mount "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX" C:\persist --vfs-cache-mode full --dir-cache-time 5m --cache-dir "$mountDir\cache" --file-perms 0777 --network-mode --no-console --log-level INFO --log-file "$mountDir\mount.log"</arguments>
-            <log mode="append">
-              <logpath>$mountDir</logpath>
-            </log>
+            <arguments>$rcloneArguments</arguments>
+            <log mode="append"><logpath>$mountDir</logpath></log>
             <onfailure action="restart" delay="10 sec"/>
             <startmode>Automatic</startmode>
             <workingdirectory>$mountDir</workingdirectory>
           </service>
           "@
           $winswConfig | Out-File -FilePath "$mountDir\rclone-persist-mount.xml" -Encoding utf8 -Force
-
-          # Install and start the service (copy WinSW executable to this isolated dir)
           Copy-Item "C:\tools\winsw\winsw.exe" "$mountDir\rclone-persist-mount.exe" -Force
           & "$mountDir\rclone-persist-mount.exe" install
           & "$mountDir\rclone-persist-mount.exe" start
-
-          # Verify service is running
+          Write-Host "Waiting 10 seconds for the Rclone service to initialize..."
+          Start-Sleep -Seconds 10
           $service = Get-Service -Name "rclone-persist-mount" -ErrorAction SilentlyContinue
-          if ($service.Status -ne "Running") { Write-Error "Failed to start Rclone mount service"; exit 1 }
-          Write-Host "Rclone mount daemon service started successfully. Changes to C:\persist will sync to R2 in real-time."
+          if ($service.Status -ne "Running") {
+            Write-Host "Service failed. Dumping logs for debugging:"
+            Write-Host "--- WinSW Error Log (rclone-persist-mount.err.log) ---"
+            Get-Content "$mountDir\rclone-persist-mount.err.log" -ErrorAction SilentlyContinue
+            Write-Host "--- Rclone Mount Log (mount.log) ---"
+            Get-Content "$mountDir\mount.log" -ErrorAction SilentlyContinue
+            Write-Error "Failed to start Rclone mount service"
+            exit 1
+          }
+          Write-Host "Rclone mount daemon service started successfully."
 
       - name: Install Tailscale
         run: |
@@ -165,8 +155,6 @@ jobs:
         run: |
           $startupDefault = "C:\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
           New-Item -ItemType Directory -Force -Path $startupDefault | Out-Null
-
-          # Goreman -> Procfile.gui
           $ws = New-Object -ComObject WScript.Shell
           $lnk1 = $ws.CreateShortcut((Join-Path $startupDefault "Goreman (Procfile.gui).lnk"))
           $lnk1.TargetPath = "C:\tools\goreman\goreman.exe"
@@ -174,8 +162,6 @@ jobs:
           $lnk1.WorkingDirectory = "C:\persist\orchestrator"
           $lnk1.WindowStyle = 7
           $lnk1.Save()
-
-          # WinSW -> run services.yml in user context
           $lnk2 = $ws.CreateShortcut((Join-Path $startupDefault "WinSW (services.yml).lnk"))
           $lnk2.TargetPath = "C:\tools\winsw\winsw.exe"
           $lnk2.Arguments  = 'run "C:\persist\orchestrator\services.yml"'
