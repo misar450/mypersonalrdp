@@ -14,7 +14,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Type DWord -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Type DWord -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Type DWord -Value 0 -Force
-          # Ensure we reattach to the already-primed session
+          # Reattach to the already-primed session
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Type DWord -Value 1 -Force
 
           netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
@@ -39,60 +39,38 @@ jobs:
           $ua = @{ "User-Agent"="curl/8.0" }
           New-Item -ItemType Directory -Force -Path "C:\tools\winsw","C:\tools\goreman","C:\persist\orchestrator","C:\persist\svc-logs" | Out-Null
 
-          # WinSW latest x64
+          # WinSW (latest x64)
           $winswRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/winsw/winsw/releases/latest" -Headers $ua
           $winswAsset = $winswRel.assets | Where-Object { $_.name -match "(?i)winsw.*x64\.exe$" } | Select-Object -First 1
           if (-not $winswAsset) { throw "WinSW x64 asset not found." }
           Invoke-WebRequest -Uri $winswAsset.browser_download_url -OutFile "C:\tools\winsw\winsw.exe"
 
-          # Goreman latest windows_amd64.zip
+          # Goreman (latest windows_amd64.zip) – robust extraction
           $gRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/mattn/goreman/releases/latest" -Headers $ua
           $gZip   = $gRel.assets | Where-Object { $_.name -match "(?i)windows_amd64\.zip$" } | Select-Object -First 1
           if (-not $gZip) { throw "Goreman windows_amd64.zip asset not found." }
           $tmpZip = "$env:TEMP\goreman.zip"
           $tmpDir = "$env:TEMP\goreman"
+          if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
           Invoke-WebRequest -Uri $gZip.browser_download_url -OutFile $tmpZip
           Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
-          Copy-Item "$tmpDir\goreman.exe" "C:\tools\goreman\goreman.exe" -Force
 
-      - name: Ensure WinSW log roll in services.yml
+          $gExe = Get-ChildItem -Path $tmpDir -Recurse -Filter "goreman.exe" | Select-Object -First 1
+          if (-not $gExe) { throw "goreman.exe not found inside the zip." }
+          Copy-Item $gExe.FullName "C:\tools\goreman\goreman.exe" -Force
+
+      - name: Register HKLM Run entries (Goreman + WinSW start)
         run: |
-          $cfg = "C:\persist\orchestrator\services.yml"
-          if (-not (Test-Path $cfg)) { Write-Host "No services.yml found. Skipping log patch."; exit 0 }
+          $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
+          if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }
 
-          $content = Get-Content $cfg -Raw
-          $changed = $false
+          # GUI apps via goreman (Procfile.gui)
+          $gCmd = "`"C:\tools\goreman\goreman.exe`" -f `"C:\persist\orchestrator\Procfile.gui`" start"
+          New-ItemProperty -Path $runKey -Name "GuiAppLauncher" -PropertyType String -Value $gCmd -Force | Out-Null
 
-          if ($content -notmatch '(^|\n)\s*logpath\s*:') {
-            Add-Content -Path $cfg -Value "`nlogpath: `"C:\persist\svc-logs`"`n"
-            $changed = $true
-          }
-          if ($content -notmatch '(^|\n)\s*log\s*:') {
-            Add-Content -Path $cfg -Value "log:`n  mode: roll`n"
-            $changed = $true
-          }
-
-          if ($changed) { Write-Host "services.yml patched to include logpath and log.mode=roll." } else { Write-Host "services.yml already has log settings." }
-
-      - name: Install WinSW service (run as .\RDP; start will be triggered on logon)
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $cfg = "C:\persist\orchestrator\services.yml"
-          $exe = "C:\tools\winsw\winsw.exe"
-          if (-not (Test-Path $cfg)) { Write-Host "No services.yml at $cfg. Skipping WinSW."; exit 0 }
-          & $exe uninstall $cfg | Out-Null 2>$null
-          & $exe install  $cfg --username ".\RDP" --password "$env:RDP_PASSWORD"
-          Write-Host "WinSW installed under .\RDP (will start via logon trigger)."
-
-      - name: Register Task Scheduler (start WinSW on RDP logon)
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $taskName = "RDP_WinSWStart"
-          $tr = 'cmd /c timeout 5 && "C:\tools\winsw\winsw.exe" start "C:\persist\orchestrator\services.yml"'
-          schtasks /Delete /TN "$taskName" /F >NUL 2>&1
-          schtasks /Create /TN "$taskName" /SC ONLOGON /RL HIGHEST /TR "$tr" /RU RDP /NP /F
+          # Start WinSW with services.yml on logon (we also have a Task Scheduler entry for RDP below)
+          $wCmd = "`"C:\tools\winsw\winsw.exe`" start `"C:\persist\orchestrator\services.yml`""
+          New-ItemProperty -Path $runKey -Name "WinSWStart" -PropertyType String -Value $wCmd -Force | Out-Null
 
       - name: Prime and keep active the RDP session
         env:
@@ -121,14 +99,52 @@ jobs:
           $s.WorkingDirectory = "C:\persist\orchestrator"
           $s.WindowStyle = 7
           $s.Save()
-          Write-Host "Startup shortcut created for Goreman."
 
           if (Test-Path "C:\persist\orchestrator\Procfile.gui") {
-            Start-Process -FilePath "C:\tools\goreman\goreman.exe" -ArgumentList @('-f','C:\persist\orchestrator\Procfile.gui','start') -WindowStyle Hidden
-            Write-Host "Goreman launched now."
+            if (-not (Get-Process -Name "goreman" -ErrorAction SilentlyContinue)) {
+              Start-Process -FilePath "C:\tools\goreman\goreman.exe" -ArgumentList @('-f','C:\persist\orchestrator\Procfile.gui','start') -WindowStyle Hidden
+              Write-Host "Goreman launched now."
+            } else {
+              Write-Host "Goreman already running."
+            }
           } else {
             Write-Host "Procfile.gui not found; Goreman will launch on next logon via Startup."
           }
+
+      - name: Ensure WinSW log roll in services.yml
+        run: |
+          $cfg = "C:\persist\orchestrator\services.yml"
+          if (-not (Test-Path $cfg)) { Write-Host "No services.yml found. Skipping log patch."; exit 0 }
+
+          $content = Get-Content $cfg -Raw
+          $changed = $false
+          if ($content -notmatch '(^|\n)\s*logpath\s*:') {
+            Add-Content -Path $cfg -Value "`nlogpath: `"C:\persist\svc-logs`"`n"
+            $changed = $true
+          }
+          if ($content -notmatch '(^|\n)\s*log\s*:') {
+            Add-Content -Path $cfg -Value "log:`n  mode: roll`n"
+            $changed = $true
+          }
+          if ($changed) { Write-Host "services.yml patched to include logpath and log.mode=roll." } else { Write-Host "services.yml already has log settings." }
+
+      - name: Install WinSW service (run as .\RDP; start will be triggered on logon)
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $cfg = "C:\persist\orchestrator\services.yml"
+          $exe = "C:\tools\winsw\winsw.exe"
+          if (-not (Test-Path $cfg)) { Write-Host "No services.yml at $cfg. Skipping WinSW."; exit 0 }
+          & $exe uninstall $cfg | Out-Null 2>$null
+          & $exe install  $cfg --username ".\RDP" --password "$env:RDP_PASSWORD"
+          Write-Host "WinSW installed under .\RDP. Start will be triggered at logon."
+
+      - name: Register Task Scheduler (start WinSW on RDP logon)
+        run: |
+          $taskName = "RDP_WinSWStart"
+          $tr = 'cmd /c timeout 5 && "C:\tools\winsw\winsw.exe" start "C:\persist\orchestrator\services.yml"'
+          schtasks /Delete /TN "$taskName" /F >NUL 2>&1
+          schtasks /Create /TN "$taskName" /SC ONLOGON /RL HIGHEST /TR "$tr" /RU RDP /NP /F
 
       - name: Install Microsoft OpenJDK 21
         run: |
