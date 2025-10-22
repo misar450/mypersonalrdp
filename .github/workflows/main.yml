@@ -54,6 +54,7 @@ jobs:
         run: |
           winget source update
           winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
+          echo "$env:LOCALAPPDATA\Microsoft\WinGet\Links" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Configure rclone remote (Cloudflare R2)
         env:
