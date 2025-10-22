@@ -50,13 +50,36 @@ jobs:
           if (-not $gExe) { throw "goreman.exe not found inside the zip." }
           Copy-Item $gExe.FullName "C:\tools\goreman\goreman.exe" -Force
 
-      - name: Install Tailscale
+      - name: Install rclone (non-interactive)
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
-          Remove-Item $installerPath -Force
+          winget source update
+          winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
+
+      - name: Configure rclone remote (Cloudflare R2)
+        env:
+          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_ACCESS_KEY_SECRET: ${{ secrets.CF_R2_ACCESS_KEY_SECRET }}
+        run: |
+          rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
+          rclone config show persist | Out-Null
+
+      - name: Pull persistent folder from Cloudflare R2
+        env:
+          CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
+          PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
+        run: |
+          $persist = "C:\persist"
+          if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
+          New-Item -ItemType Directory -Force -Path $persist | Out-Null
+          rclone mkdir "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX"
+          rclone sync "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX" "$persist" --fast-list --checkers 16 --transfers 8
+          Write-Host "Persistent folder pulled to $persist."
+
+      - name: Install Tailscale (winget)
+        run: |
+          winget source update
+          winget install -e --id Tailscale.Tailscale --accept-package-agreements --accept-source-agreements --silent --scope machine --source winget
 
       - name: Establish Tailscale connection
         run: |
@@ -131,33 +154,6 @@ jobs:
           Start-Sleep -Seconds 15
           Start-Process "$env:SystemRoot\System32\cmdkey.exe" -ArgumentList @("/delete:$target") -WindowStyle Hidden -Wait
           Write-Host "RDP session for user '$env:RDP_USER' is active."
-
-      # --- Cloudflare R2 + rclone (temporarily disabled) ---
-      # - name: Install rclone (non-interactive)
-      #   run: |
-      #     winget source update
-      #     winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
-      #
-      # - name: Configure rclone remote (Cloudflare R2)
-      #   env:
-      #     CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
-      #     CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
-      #     CF_R2_ACCESS_KEY_SECRET: ${{ secrets.CF_R2_ACCESS_KEY_SECRET }}
-      #   run: |
-      #     rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
-      #     rclone config show persist | Out-Null
-      #
-      # - name: Pull persistent folder from Cloudflare R2
-      #   env:
-      #     CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
-      #     PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
-      #   run: |
-      #     $persist = "C:\persist"
-      #     if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
-      #     New-Item -ItemType Directory -Force -Path $persist | Out-Null
-      #     rclone mkdir "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX"
-      #     rclone sync "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX" "$persist" --fast-list --checkers 16 --transfers 8
-      # --- End Cloudflare R2 + rclone (temporarily disabled) ---
 
       - name: Verify RDP accessibility
         run: |
