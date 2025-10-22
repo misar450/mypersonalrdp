@@ -61,10 +61,10 @@ jobs:
           rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
           rclone config show persist | Out-Null
 
-      - name: Install WinFsp for Rclone mounting
+      - name: Install WinFSP for Rclone mounting
         run: |
           winget source update
-          winget install --id=WinFsp.WinFsp -e --accept-package-agreements --accept-source-agreements --silent --scope machine
+          winget install --id=SchoonmakerProductionsLLC.WinFSP -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
       - name: Set up Rclone mount as a background daemon service
         env:
@@ -73,10 +73,14 @@ jobs:
         shell: pwsh
         run: |
           $mountDir = "C:\tools\rclone-mount"
-          New-Item -ItemType Directory -Force -Path "$mountDir\cache" | Out-Null
-          New-Item -ItemType Directory -Force -Path "C:\persist" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$mountDir\cache", "C:\persist" | Out-Null
           $rcloneConfig = rclone config file | Out-String | ForEach-Object { $_.Trim() }
-          $rcloneArguments = "mount `"persist:$($env:CF_R2_BUCKET)/$($env:PERSIST_PREFIX)`" C:\persist --config `"$rcloneConfig`" --vfs-cache-mode full --dir-cache-time 5m --cache-dir `"$mountDir\cache`" --file-perms 0777 --network-mode --no-console --log-level INFO --log-file `"$mountDir\mount.log`""
+          $remotePath = "persist:$($env:CF_R2_BUCKET)"
+          if ($env:PERSIST_PREFIX) {
+            $remotePath = "$remotePath/$($env:PERSIST_PREFIX)"
+          }
+          $rcloneArguments = "mount `"$remotePath`" C:\persist --config `"$rcloneConfig`" --vfs-cache-mode full --dir-cache-time 5m --cache-dir `"$mountDir\cache`" --file-perms 0777 --network-mode --no-console --log-level INFO --log-file `"$mountDir\mount.log`""
+          Write-Host "Generated Rclone Arguments: $rcloneArguments"
           $winswConfig = @"
           <service>
             <id>rclone-persist-mount</id>
@@ -99,9 +103,7 @@ jobs:
           $service = Get-Service -Name "rclone-persist-mount" -ErrorAction SilentlyContinue
           if ($service.Status -ne "Running") {
             Write-Host "Service failed. Dumping logs for debugging:"
-            Write-Host "--- WinSW Error Log (rclone-persist-mount.err.log) ---"
             Get-Content "$mountDir\rclone-persist-mount.err.log" -ErrorAction SilentlyContinue
-            Write-Host "--- Rclone Mount Log (mount.log) ---"
             Get-Content "$mountDir\mount.log" -ErrorAction SilentlyContinue
             Write-Error "Failed to start Rclone mount service"
             exit 1
