@@ -7,6 +7,8 @@ jobs:
   secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
+    env:
+      RDP_USER: RDP
 
     steps:
       - name: Configure core RDP settings
@@ -14,38 +16,28 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Type DWord -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Type DWord -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Type DWord -Value 0 -Force
-          # Reattach to the already-primed session
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Type DWord -Value 1 -Force
-
           netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
-
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP user
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      - name: Install Microsoft OpenJDK 21
         run: |
-          $password   = $env:RDP_PASSWORD
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          if (-not (Get-LocalUser -Name "RDP")) { Write-Error "User creation failed"; exit 1 }
+          winget source update
+          winget install --id=Microsoft.OpenJDK.21 -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
       - name: Install tools (WinSW + Goreman)
         run: |
           $ua = @{ "User-Agent"="curl/8.0" }
-          New-Item -ItemType Directory -Force -Path "C:\tools\winsw","C:\tools\goreman","C:\persist\orchestrator","C:\persist\svc-logs" | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\tools\winsw","C:\tools\goreman","C:\persist\orchestrator" | Out-Null
 
-          # WinSW (latest x64)
+          # WinSW latest x64
           $winswRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/winsw/winsw/releases/latest" -Headers $ua
           $winswAsset = $winswRel.assets | Where-Object { $_.name -match "(?i)winsw.*x64\.exe$" } | Select-Object -First 1
           if (-not $winswAsset) { throw "WinSW x64 asset not found." }
           Invoke-WebRequest -Uri $winswAsset.browser_download_url -OutFile "C:\tools\winsw\winsw.exe"
 
-          # Goreman (latest windows_amd64.zip) – robust extraction
+          # Goreman latest windows_amd64.zip
           $gRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/mattn/goreman/releases/latest" -Headers $ua
           $gZip   = $gRel.assets | Where-Object { $_.name -match "(?i)windows_amd64\.zip$" } | Select-Object -First 1
           if (-not $gZip) { throw "Goreman windows_amd64.zip asset not found." }
@@ -54,129 +46,9 @@ jobs:
           if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
           Invoke-WebRequest -Uri $gZip.browser_download_url -OutFile $tmpZip
           Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
-
           $gExe = Get-ChildItem -Path $tmpDir -Recurse -Filter "goreman.exe" | Select-Object -First 1
           if (-not $gExe) { throw "goreman.exe not found inside the zip." }
           Copy-Item $gExe.FullName "C:\tools\goreman\goreman.exe" -Force
-
-      - name: Register HKLM Run entries (Goreman + WinSW start)
-        run: |
-          $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
-          if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }
-
-          # GUI apps via goreman (Procfile.gui)
-          $gCmd = "`"C:\tools\goreman\goreman.exe`" -f `"C:\persist\orchestrator\Procfile.gui`" start"
-          New-ItemProperty -Path $runKey -Name "GuiAppLauncher" -PropertyType String -Value $gCmd -Force | Out-Null
-
-          # Start WinSW with services.yml on logon (we also have a Task Scheduler entry for RDP below)
-          $wCmd = "`"C:\tools\winsw\winsw.exe`" start `"C:\persist\orchestrator\services.yml`""
-          New-ItemProperty -Path $runKey -Name "WinSWStart" -PropertyType String -Value $wCmd -Force | Out-Null
-
-      - name: Prime and keep active the RDP session
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          New-Item -Path 'HKCU:\Software\Microsoft\Terminal Server Client' -Force | Out-Null
-          New-ItemProperty -Path 'HKCU:\Software\Microsoft\Terminal Server Client' -Name 'AuthenticationLevelOverride' -PropertyType DWord -Value 0 -Force | Out-Null
-          $target = "TERMSRV/127.0.0.1"
-          Start-Process "$env:SystemRoot\System32\cmdkey.exe" -ArgumentList @("/generic:$target","/user:RDP","/pass:$env:RDP_PASSWORD") -WindowStyle Hidden -Wait
-          $mstsc = Join-Path $env:SystemRoot "System32\mstsc.exe"
-          Start-Process -FilePath $mstsc -ArgumentList @("/v:127.0.0.1","/f") -WindowStyle Hidden
-          Start-Sleep -Seconds 15
-          Start-Process "$env:SystemRoot\System32\cmdkey.exe" -ArgumentList @("/delete:$target") -WindowStyle Hidden -Wait
-          Write-Host "RDP session for user 'RDP' is active."
-
-      - name: Create RDP Startup shortcut for Goreman and launch now
-        run: |
-          $startup = "C:\Users\RDP\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-          New-Item -ItemType Directory -Force -Path $startup | Out-Null
-
-          $lnkPath = Join-Path $startup "Goreman (Procfile.gui).lnk"
-          $ws = New-Object -ComObject WScript.Shell
-          $s  = $ws.CreateShortcut($lnkPath)
-          $s.TargetPath = "C:\tools\goreman\goreman.exe"
-          $s.Arguments  = '-f "C:\persist\orchestrator\Procfile.gui" start'
-          $s.WorkingDirectory = "C:\persist\orchestrator"
-          $s.WindowStyle = 7
-          $s.Save()
-
-          if (Test-Path "C:\persist\orchestrator\Procfile.gui") {
-            if (-not (Get-Process -Name "goreman" -ErrorAction SilentlyContinue)) {
-              Start-Process -FilePath "C:\tools\goreman\goreman.exe" -ArgumentList @('-f','C:\persist\orchestrator\Procfile.gui','start') -WindowStyle Hidden
-              Write-Host "Goreman launched now."
-            } else {
-              Write-Host "Goreman already running."
-            }
-          } else {
-            Write-Host "Procfile.gui not found; Goreman will launch on next logon via Startup."
-          }
-
-      - name: Ensure WinSW log roll in services.yml
-        run: |
-          $cfg = "C:\persist\orchestrator\services.yml"
-          if (-not (Test-Path $cfg)) { Write-Host "No services.yml found. Skipping log patch."; exit 0 }
-
-          $content = Get-Content $cfg -Raw
-          $changed = $false
-          if ($content -notmatch '(^|\n)\s*logpath\s*:') {
-            Add-Content -Path $cfg -Value "`nlogpath: `"C:\persist\svc-logs`"`n"
-            $changed = $true
-          }
-          if ($content -notmatch '(^|\n)\s*log\s*:') {
-            Add-Content -Path $cfg -Value "log:`n  mode: roll`n"
-            $changed = $true
-          }
-          if ($changed) { Write-Host "services.yml patched to include logpath and log.mode=roll." } else { Write-Host "services.yml already has log settings." }
-
-      - name: Install WinSW service (run as .\RDP; start will be triggered on logon)
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $cfg = "C:\persist\orchestrator\services.yml"
-          $exe = "C:\tools\winsw\winsw.exe"
-          if (-not (Test-Path $cfg)) { Write-Host "No services.yml at $cfg. Skipping WinSW."; exit 0 }
-          & $exe uninstall $cfg | Out-Null 2>$null
-          & $exe install  $cfg --username ".\RDP" --password "$env:RDP_PASSWORD"
-          Write-Host "WinSW installed under .\RDP. Start will be triggered at logon."
-
-      - name: Register Task Scheduler (start WinSW on RDP logon)
-        run: |
-          $taskName = "RDP_WinSWStart"
-          $tr = 'cmd /c timeout 5 && "C:\tools\winsw\winsw.exe" start "C:\persist\orchestrator\services.yml"'
-          schtasks /Delete /TN "$taskName" /F >NUL 2>&1
-          schtasks /Create /TN "$taskName" /SC ONLOGON /RL HIGHEST /TR "$tr" /RU RDP /NP /F
-
-      - name: Install Microsoft OpenJDK 21
-        run: |
-          winget source update
-          winget install --id=Microsoft.OpenJDK.21 -e --accept-package-agreements --accept-source-agreements --silent --scope machine
-
-      # --- Cloudflare R2 + rclone (temporarily disabled) ---
-      # - name: Install rclone (non-interactive)
-      #   run: |
-      #     winget source update
-      #     winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
-      #
-      # - name: Configure rclone remote (Cloudflare R2)
-      #   env:
-      #     CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
-      #     CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
-      #     CF_R2_ACCESS_KEY_SECRET: ${{ secrets.CF_R2_ACCESS_KEY_SECRET }}
-      #   run: |
-      #     rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
-      #     rclone config show persist | Out-Null
-      #
-      # - name: Pull persistent folder from Cloudflare R2
-      #   env:
-      #     CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
-      #     PERSIST_PREFIX: ${{ secrets:PERSIST_PREFIX }}
-      #   run: |
-      #     $persist = "C:\persist"
-      #     if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
-      #     New-Item -ItemType Directory -Force -Path $persist | Out-Null
-      #     rclone mkdir "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX"
-      #     rclone sync "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX" "$persist" --fast-list --checkers 16 --transfers 8
-      # --- End Cloudflare R2 + rclone (temporarily disabled) ---
 
       - name: Install Tailscale
         run: |
@@ -211,6 +83,82 @@ jobs:
           if ($v4.NlMtu -ne 1400 -or $v6.NlMtu -ne 1400) { Write-Error "Unable to set MTU=1400 on 'Tailscale'."; exit 1 }
           Write-Host "MTU successfully set to 1400 on 'Tailscale' (IPv4 and IPv6)."
 
+      - name: Create local user (${{ env.RDP_USER }})
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $u = "$env:RDP_USER"
+          $p = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $p -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member $u -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
+          echo "RDP_CREDS=User: $u | Password: $env:RDP_PASSWORD" >> $env:GITHUB_ENV
+
+      - name: Place Startup shortcuts for ${{ env.RDP_USER }} via Default profile
+        run: |
+          $startupDefault = "C:\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          New-Item -ItemType Directory -Force -Path $startupDefault | Out-Null
+
+          # Goreman -> Procfile.gui
+          $ws = New-Object -ComObject WScript.Shell
+          $lnk1 = $ws.CreateShortcut((Join-Path $startupDefault "Goreman (Procfile.gui).lnk"))
+          $lnk1.TargetPath = "C:\tools\goreman\goreman.exe"
+          $lnk1.Arguments  = '-f "C:\persist\orchestrator\Procfile.gui" start'
+          $lnk1.WorkingDirectory = "C:\persist\orchestrator"
+          $lnk1.WindowStyle = 7
+          $lnk1.Save()
+
+          # WinSW -> run services.yml in user context
+          $lnk2 = $ws.CreateShortcut((Join-Path $startupDefault "WinSW (services.yml).lnk"))
+          $lnk2.TargetPath = "C:\tools\winsw\winsw.exe"
+          $lnk2.Arguments  = 'run "C:\persist\orchestrator\services.yml"'
+          $lnk2.WorkingDirectory = "C:\persist\orchestrator"
+          $lnk2.WindowStyle = 7
+          $lnk2.Save()
+
+      - name: Prime and keep active the ${{ env.RDP_USER }} session
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          New-Item -Path 'HKCU:\Software\Microsoft\Terminal Server Client' -Force | Out-Null
+          New-ItemProperty -Path 'HKCU:\Software\Microsoft\Terminal Server Client' -Name 'AuthenticationLevelOverride' -PropertyType DWord -Value 0 -Force | Out-Null
+          $target = "TERMSRV/127.0.0.1"
+          Start-Process "$env:SystemRoot\System32\cmdkey.exe" -ArgumentList @("/generic:$target","/user:$env:RDP_USER","/pass:$env:RDP_PASSWORD") -WindowStyle Hidden -Wait
+          $mstsc = Join-Path $env:SystemRoot "System32\mstsc.exe"
+          Start-Process -FilePath $mstsc -ArgumentList @("/v:127.0.0.1","/f") -WindowStyle Hidden
+          Start-Sleep -Seconds 15
+          Start-Process "$env:SystemRoot\System32\cmdkey.exe" -ArgumentList @("/delete:$target") -WindowStyle Hidden -Wait
+          Write-Host "RDP session for user '$env:RDP_USER' is active."
+
+      # --- Cloudflare R2 + rclone (temporarily disabled) ---
+      # - name: Install rclone (non-interactive)
+      #   run: |
+      #     winget source update
+      #     winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
+      #
+      # - name: Configure rclone remote (Cloudflare R2)
+      #   env:
+      #     CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+      #     CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+      #     CF_R2_ACCESS_KEY_SECRET: ${{ secrets.CF_R2_ACCESS_KEY_SECRET }}
+      #   run: |
+      #     rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
+      #     rclone config show persist | Out-Null
+      #
+      # - name: Pull persistent folder from Cloudflare R2
+      #   env:
+      #     CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
+      #     PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
+      #   run: |
+      #     $persist = "C:\persist"
+      #     if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
+      #     New-Item -ItemType Directory -Force -Path $persist | Out-Null
+      #     rclone mkdir "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX"
+      #     rclone sync "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX" "$persist" --fast-list --checkers 16 --transfers 8
+      # --- End Cloudflare R2 + rclone (temporarily disabled) ---
+
       - name: Verify RDP accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
@@ -222,7 +170,7 @@ jobs:
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
+          Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
           while ($true) {
