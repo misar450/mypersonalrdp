@@ -77,7 +77,7 @@ jobs:
           rclone sync "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX" "$persist" --fast-list --checkers 16 --transfers 8
           Write-Host "Persistent folder pulled to $persist."
 
-      - name: Install Tailscale (winget)
+      - name: Install Tailscale
         run: |
           winget source update
           winget install -e --id Tailscale.Tailscale --accept-package-agreements --accept-source-agreements --silent --scope machine --source winget
