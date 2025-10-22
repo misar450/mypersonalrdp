@@ -50,7 +50,7 @@ jobs:
           if (-not $gExe) { throw "goreman.exe not found inside the zip." }
           Copy-Item $gExe.FullName "C:\tools\goreman\goreman.exe" -Force
 
-      - name: Install Rclone (non-interactive)
+      - name: Install Rclone
         run: |
           winget source update
           winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
