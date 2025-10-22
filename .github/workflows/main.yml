@@ -11,108 +11,133 @@ jobs:
     steps:
       - name: Configure core RDP settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Type DWord -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Type DWord -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Type DWord -Value 0 -Force
+          # Ensure we reattach to the already-primed session
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Type DWord -Value 1 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
       - name: Create RDP user
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          # Use repository secret as password
           $password   = $env:RDP_PASSWORD
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+          if (-not (Get-LocalUser -Name "RDP")) { Write-Error "User creation failed"; exit 1 }
+
+      - name: Install tools (WinSW + Goreman)
+        run: |
+          $ua = @{ "User-Agent"="curl/8.0" }
+          New-Item -ItemType Directory -Force -Path "C:\tools\winsw","C:\tools\goreman","C:\persist\orchestrator","C:\persist\svc-logs" | Out-Null
+
+          # WinSW latest x64
+          $winswRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/winsw/winsw/releases/latest" -Headers $ua
+          $winswAsset = $winswRel.assets | Where-Object { $_.name -match "(?i)winsw.*x64\.exe$" } | Select-Object -First 1
+          if (-not $winswAsset) { throw "WinSW x64 asset not found." }
+          Invoke-WebRequest -Uri $winswAsset.browser_download_url -OutFile "C:\tools\winsw\winsw.exe"
+
+          # Goreman latest windows_amd64.zip
+          $gRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/mattn/goreman/releases/latest" -Headers $ua
+          $gZip   = $gRel.assets | Where-Object { $_.name -match "(?i)windows_amd64\.zip$" } | Select-Object -First 1
+          if (-not $gZip) { throw "Goreman windows_amd64.zip asset not found." }
+          $tmpZip = "$env:TEMP\goreman.zip"
+          $tmpDir = "$env:TEMP\goreman"
+          Invoke-WebRequest -Uri $gZip.browser_download_url -OutFile $tmpZip
+          Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
+          Copy-Item "$tmpDir\goreman.exe" "C:\tools\goreman\goreman.exe" -Force
+
+      - name: Ensure WinSW log roll in services.yml
+        run: |
+          $cfg = "C:\persist\orchestrator\services.yml"
+          if (-not (Test-Path $cfg)) { Write-Host "No services.yml found. Skipping log patch."; exit 0 }
+
+          $content = Get-Content $cfg -Raw
+          $changed = $false
+
+          if ($content -notmatch '(^|\n)\s*logpath\s*:') {
+            Add-Content -Path $cfg -Value "`nlogpath: `"C:\persist\svc-logs`"`n"
+            $changed = $true
+          }
+          if ($content -notmatch '(^|\n)\s*log\s*:') {
+            Add-Content -Path $cfg -Value "log:`n  mode: roll`n"
+            $changed = $true
           }
 
-      - name: Register Goreman autostart via HKLM Run (Procfile.gui)
-        run: |
-          # Download goreman and place it under C:\persist
-          $zipUrl = "https://github.com/mattn/goreman/releases/download/v0.3.16/goreman_v0.3.16_windows_amd64.zip"
-          $zip    = "$env:TEMP\goreman.zip"
-          $tmp    = "$env:TEMP\goreman"
-          $dest   = "C:\persist"
-          $exe    = Join-Path $dest "goreman.exe"
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          Invoke-WebRequest -Uri $zipUrl -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $tmp -Force
-          Copy-Item "$tmp\goreman.exe" $exe -Force
+          if ($changed) { Write-Host "services.yml patched to include logpath and log.mode=roll." } else { Write-Host "services.yml already has log settings." }
 
-          # Set HKLM Run so any interactive logon launches goreman with Procfile.gui
-          $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
-          if (-not (Test-Path $runKey)) { New-Item -Path $runKey -Force | Out-Null }
-          $cmd = "`"$exe`" -f `"C:\persist\orchestrator\Procfile.gui`" start"
-          New-ItemProperty -Path $runKey -Name "GuiAppLauncher" -PropertyType String -Value $cmd -Force | Out-Null
-          Write-Host "Configured HKLM Run to start goreman with Procfile.gui (if present)."
-
-      - name: Prime and maintain active RDP session
+      - name: Install WinSW service (run as .\RDP; start will be triggered on logon)
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          # Relaja las comprobaciones de autenticación del cliente RDP, necesario para la automatización.
+          $cfg = "C:\persist\orchestrator\services.yml"
+          $exe = "C:\tools\winsw\winsw.exe"
+          if (-not (Test-Path $cfg)) { Write-Host "No services.yml at $cfg. Skipping WinSW."; exit 0 }
+          & $exe uninstall $cfg | Out-Null 2>$null
+          & $exe install  $cfg --username ".\RDP" --password "$env:RDP_PASSWORD"
+          Write-Host "WinSW installed under .\RDP (will start via logon trigger)."
+
+      - name: Register Task Scheduler (start WinSW on RDP logon)
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $taskName = "RDP_WinSWStart"
+          $tr = 'cmd /c timeout 5 && "C:\tools\winsw\winsw.exe" start "C:\persist\orchestrator\services.yml"'
+          schtasks /Delete /TN "$taskName" /F >NUL 2>&1
+          schtasks /Create /TN "$taskName" /SC ONLOGON /RL HIGHEST /TR "$tr" /RU RDP /NP /F
+
+      - name: Prime and keep active the RDP session
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
           New-Item -Path 'HKCU:\Software\Microsoft\Terminal Server Client' -Force | Out-Null
           New-ItemProperty -Path 'HKCU:\Software\Microsoft\Terminal Server Client' -Name 'AuthenticationLevelOverride' -PropertyType DWord -Value 0 -Force | Out-Null
-
           $target = "TERMSRV/127.0.0.1"
-          $user   = "RDP"
-          $pass   = $env:RDP_PASSWORD
-
-          # Almacena las credenciales temporalmente para que mstsc no pida contraseña.
-          Start-Process -FilePath "$env:SystemRoot\System32\cmdkey.exe" `
-                        -ArgumentList @("/generic:$target","/user:$user","/pass:$pass") `
-                        -WindowStyle Hidden -Wait
-
-          # Lanza el cliente RDP (mstsc.exe) para conectarse a localhost.
-          # Lo ejecutamos en una ventana oculta y no lo cerramos. Esto mantendrá la sesión ACTIVA.
-          # Se añade el argumento /f (fullscreen) para asegurar que el escritorio se renderiza completamente.
+          Start-Process "$env:SystemRoot\System32\cmdkey.exe" -ArgumentList @("/generic:$target","/user:RDP","/pass:$env:RDP_PASSWORD") -WindowStyle Hidden -Wait
           $mstsc = Join-Path $env:SystemRoot "System32\mstsc.exe"
-          Start-Process -FilePath $mstsc -ArgumentList @("/v:127.0.0.1", "/f") -WindowStyle Hidden
-
-          # Damos tiempo suficiente (15 segundos) para que la sesión se inicie completamente
-          # y el escritorio (explorer.exe) se cargue en segundo plano.
-          Write-Host "Waiting for the local RDP session to fully initialize..."
+          Start-Process -FilePath $mstsc -ArgumentList @("/v:127.0.0.1","/f") -WindowStyle Hidden
           Start-Sleep -Seconds 15
+          Start-Process "$env:SystemRoot\System32\cmdkey.exe" -ArgumentList @("/delete:$target") -WindowStyle Hidden -Wait
+          Write-Host "RDP session for user 'RDP' is active."
 
-          # Limpiamos las credenciales almacenadas por seguridad. El proceso mstsc ya las ha utilizado.
-          Start-Process -FilePath "$env:SystemRoot\System32\cmdkey.exe" `
-                        -ArgumentList @("/delete:$target") `
-                        -WindowStyle Hidden -Wait
+      - name: Create RDP Startup shortcut for Goreman and launch now
+        run: |
+          $startup = "C:\Users\RDP\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          New-Item -ItemType Directory -Force -Path $startup | Out-Null
 
-          Write-Host "RDP session for user 'RDP' has been started and is being held active."
+          $lnkPath = Join-Path $startup "Goreman (Procfile.gui).lnk"
+          $ws = New-Object -ComObject WScript.Shell
+          $s  = $ws.CreateShortcut($lnkPath)
+          $s.TargetPath = "C:\tools\goreman\goreman.exe"
+          $s.Arguments  = '-f "C:\persist\orchestrator\Procfile.gui" start'
+          $s.WorkingDirectory = "C:\persist\orchestrator"
+          $s.WindowStyle = 7
+          $s.Save()
+          Write-Host "Startup shortcut created for Goreman."
+
+          if (Test-Path "C:\persist\orchestrator\Procfile.gui") {
+            Start-Process -FilePath "C:\tools\goreman\goreman.exe" -ArgumentList @('-f','C:\persist\orchestrator\Procfile.gui','start') -WindowStyle Hidden
+            Write-Host "Goreman launched now."
+          } else {
+            Write-Host "Procfile.gui not found; Goreman will launch on next logon via Startup."
+          }
 
       - name: Install Microsoft OpenJDK 21
         run: |
-          # Update sources and install OpenJDK 21
           winget source update
           winget install --id=Microsoft.OpenJDK.21 -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
       # --- Cloudflare R2 + rclone (temporarily disabled) ---
       # - name: Install rclone (non-interactive)
       #   run: |
-      #     # Install rclone via winget
       #     winget source update
       #     winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
       #
@@ -122,189 +147,60 @@ jobs:
       #     CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
       #     CF_R2_ACCESS_KEY_SECRET: ${{ secrets.CF_R2_ACCESS_KEY_SECRET }}
       #   run: |
-      #     # Create rclone remote named 'persist' for Cloudflare R2 (S3-compatible)
       #     rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
       #     rclone config show persist | Out-Null
       #
       # - name: Pull persistent folder from Cloudflare R2
       #   env:
       #     CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
-      #     PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
+      #     PERSIST_PREFIX: ${{ secrets:PERSIST_PREFIX }}
       #   run: |
-      #     # Sync from R2 -> C:\persist
       #     $persist = "C:\persist"
       #     if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
       #     New-Item -ItemType Directory -Force -Path $persist | Out-Null
-      #     # Ensure destination exists on R2 (no-op if it already exists)
       #     rclone mkdir "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX"
       #     rclone sync "persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX" "$persist" --fast-list --checkers 16 --transfers 8
-      #     Write-Host "Persistent folder pulled to $persist."
       # --- End Cloudflare R2 + rclone (temporarily disabled) ---
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale connection
         run: |
-          # Bring up Tailscale with the provided auth key
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner
-          
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname="gh-$env:GITHUB_RUN_ID"
+          $tsIP = $null; $retries = 0
+          while (-not $tsIP -and $retries -lt 24) {
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
           }
-          
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       - name: Set MTU 1400 on Tailscale and verify
         run: |
-          # Ensure the "Tailscale" interface exists before applying MTU
           $iface = Get-NetIPInterface -InterfaceAlias "Tailscale" -ErrorAction SilentlyContinue
-          if (-not $iface) {
-            Write-Error "Interface 'Tailscale' not found."
-            exit 1
-          }
-
-          # Apply MTU via netsh (suppress 'Ok.' output)
+          if (-not $iface) { Write-Error "Interface 'Tailscale' not found."; exit 1 }
           netsh interface ipv4 set subinterface "Tailscale" mtu=1400 store=persistent > $null 2>&1
           netsh interface ipv6 set subinterface "Tailscale" mtu=1400 store=persistent > $null 2>&1
-
-          # Verify specific values on the Tailscale interface
           $v4 = Get-NetIPInterface -InterfaceAlias "Tailscale" -AddressFamily IPv4
           $v6 = Get-NetIPInterface -InterfaceAlias "Tailscale" -AddressFamily IPv6
           Write-Host "Tailscale MTU IPv4: $($v4.NlMtu)"
           Write-Host "Tailscale MTU IPv6: $($v6.NlMtu)"
-
-          if ($v4.NlMtu -ne 1400 -or $v6.NlMtu -ne 1400) {
-            Write-Error "Unable to set MTU=1400 on 'Tailscale'."
-            exit 1
-          }
-
+          if ($v4.NlMtu -ne 1400 -or $v6.NlMtu -ne 1400) { Write-Error "Unable to set MTU=1400 on 'Tailscale'."; exit 1 }
           Write-Host "MTU successfully set to 1400 on 'Tailscale' (IPv4 and IPv6)."
-
-      - name: Install and start WinSW orchestrator (single YAML, run as RDP)
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          # Layout:
-          #   C:\persist\orchestrator\orchestrator.yaml   (WinSW config: single service)
-          #   C:\persist\orchestrator\Procfile.gui        (used by goreman at user logon)
-          #   C:\persist\svc-logs                         (service logs)
-          #
-          # This step:
-          #   - Downloads WinSW x64 and renames to orchestrator.exe (single instance)
-          #   - Installs service 'orchestrator'
-          #   - Runs service under .\RDP using RDP_PASSWORD (stored in SCM)
-          #   - Grants 'Log on as a service' to RDP, preserving existing assignments
-          #   - Starts the service
-
-          $orchDir = "C:\persist\orchestrator"
-          $logsDir = "C:\persist\svc-logs"
-          New-Item -ItemType Directory -Force -Path $orchDir, $logsDir | Out-Null
-
-          $yaml = Join-Path $orchDir "orchestrator.yaml"
-          if (-not (Test-Path $yaml)) {
-            Write-Host "No orchestrator.yaml found at $orchDir. Skipping WinSW install."
-            exit 0
-          }
-
-          # Download latest WinSW x64
-          $exe  = Join-Path $orchDir "orchestrator.exe"
-          $rel  = Invoke-RestMethod -Uri "https://api.github.com/repos/winsw/winsw/releases/latest" -Headers @{ "User-Agent"="curl/8.0" }
-          $asset= $rel.assets | Where-Object { $_.name -match "(?i)winsw.*x64\.exe$" } | Select-Object -First 1
-          if (-not $asset) { throw "WinSW x64 asset not found." }
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $exe
-
-          # Install service (id defaults to exe base if not specified in YAML; recommend id: orchestrator)
-          & $exe stop      | Out-Null 2>$null
-          & $exe uninstall | Out-Null 2>$null
-          & $exe install
-
-          # Configure service to run as .\RDP with secret password (kept by SCM, not in YAML)
-          sc.exe config orchestrator obj= ".\RDP" password= "$env:RDP_PASSWORD" | Out-Null
-
-          # Grant 'Log on as a service' to RDP, preserving existing entries
-          $export = Join-Path $env:TEMP "secpol_export.inf"
-          secedit /export /cfg "$export" /areas USER_RIGHTS | Out-Null
-
-          $lines = Get-Content "$export"
-          $idx = ($lines | Select-String -Pattern '^\s*SeServiceLogonRight\s*=' -List).LineNumber
-          $current = ""
-          if ($idx) {
-            $current = ($lines[$idx-1] -replace '^\s*SeServiceLogonRight\s*=\s*','').Trim()
-          }
-          $vals = @()
-          if ($current) { $vals = ($current -split '\s*,\s*') | Where-Object { $_ -ne '' } }
-          $acct = "$env:COMPUTERNAME\RDP"
-          if ($vals -notcontains $acct) { $vals += $acct }
-
-          $inf = @"
-          [Unicode]
-          Unicode=yes
-          [Version]
-          signature="$CHICAGO$"
-          Revision=1
-          [Privilege Rights]
-          SeServiceLogonRight = $(($vals -join ','))
-          "@
-          $grant = Join-Path $env:TEMP "grant_service_logon.inf"
-          $db    = Join-Path $env:TEMP "secedit.sdb"
-          $inf | Set-Content -Path $grant -Encoding ASCII
-          secedit /configure /db "$db" /cfg "$grant" /areas USER_RIGHTS | Out-Null
-
-          # Start the service
-          sc.exe start orchestrator | Out-Null
-          Write-Host "WinSW orchestrator service installed and started as .\RDP."
 
       - name: Verify RDP accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
+          if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP connection to RDP port 3389 failed"; exit 1 }
           Write-Host "TCP connectivity successful!"
-
-      # --- Cloudflare R2 background sync (temporarily disabled) ---
-      # - name: Start background sync to Cloudflare R2
-      #   env:
-      #     CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
-      #     PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
-      #   run: |
-      #     # Start a background process to periodically sync C:\persist -> R2 every 10 minutes
-      #     $persist = "C:\persist"
-      #     if (-not $env:PERSIST_PREFIX) { $env:PERSIST_PREFIX = "persist" }
-      #     $cmd = "$persist\_r2sync.ps1"
-      #     @"
-      #     while ($true) {
-      #       try {
-      #         rclone sync `"$persist`" `"persist:$env:CF_R2_BUCKET/$env:PERSIST_PREFIX`" --fast-list --checkers 8 --transfers 4 | Out-File -FilePath `"$persist\_r2sync.log`" -Append
-      #       } catch {
-      #         "`$($_.Exception.Message)" | Out-File -FilePath `"$persist\_r2sync.log`" -Append
-      #       }
-      #       Start-Sleep -Seconds 600
-      #     }
-      #     "@ | Set-Content -Path $cmd -Encoding UTF8
-      #     Start-Process -FilePath "$PSHOME\pwsh.exe" -ArgumentList @("-NoProfile","-ExecutionPolicy","Bypass","-File",$cmd) -WindowStyle Hidden
-      #     Write-Host "Started background sync task for C:\persist."
-      # --- End Cloudflare R2 background sync (temporarily disabled) ---
 
       - name: Maintain connection
         run: |
@@ -313,9 +209,7 @@ jobs:
           Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+            Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+            Start-Sleep -Seconds 300
           }
