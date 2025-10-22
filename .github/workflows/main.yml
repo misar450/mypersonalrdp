@@ -50,13 +50,13 @@ jobs:
           if (-not $gExe) { throw "goreman.exe not found inside the zip." }
           Copy-Item $gExe.FullName "C:\tools\goreman\goreman.exe" -Force
 
-      - name: Install rclone (non-interactive)
+      - name: Install Rclone (non-interactive)
         run: |
           winget source update
           winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
           echo "$env:LOCALAPPDATA\Microsoft\WinGet\Links" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Configure rclone remote (Cloudflare R2)
+      - name: Configure Rclone remote (Cloudflare R2)
         env:
           CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
           CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
