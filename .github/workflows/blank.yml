@@ -9,7 +9,6 @@ jobs:
     timeout-minutes: 3600
     env:
       RDP_USER: RDP
-      # Global rclone config path so both the job and the service see the same file
       RCLONE_CONFIG: C:\tools\rclone\rclone.conf
 
     steps:
