@@ -9,6 +9,8 @@ jobs:
     timeout-minutes: 3600
     env:
       RDP_USER: RDP
+      # Global rclone config path so both the job and the service see the same file
+      RCLONE_CONFIG: C:\tools\rclone\rclone.conf
 
     steps:
       - name: Configure core RDP settings
@@ -27,13 +29,19 @@ jobs:
           winget install --id=Microsoft.OpenJDK.21 -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
       - name: Install tools (WinSW + Goreman)
+        shell: pwsh
         run: |
           $ua = @{ "User-Agent"="curl/8.0" }
           New-Item -ItemType Directory -Force -Path "C:\tools\winsw","C:\tools\goreman","C:\persist\orchestrator" | Out-Null
+
+          # WinSW latest but ensure major v3
           $winswRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/winsw/winsw/releases/latest" -Headers $ua
+          if ($winswRel.tag_name -notmatch '^v3\.') { throw "Expected WinSW v3.x release, got $($winswRel.tag_name)." }
           $winswAsset = $winswRel.assets | Where-Object { $_.name -match "(?i)winsw.*x64\.exe$" } | Select-Object -First 1
           if (-not $winswAsset) { throw "WinSW x64 asset not found." }
           Invoke-WebRequest -Uri $winswAsset.browser_download_url -OutFile "C:\tools\winsw\winsw.exe"
+
+          # Goreman latest windows_amd64
           $gRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/mattn/goreman/releases/latest" -Headers $ua
           $gZip   = $gRel.assets | Where-Object { $_.name -match "(?i)windows_amd64\.zip$" } | Select-Object -First 1
           if (-not $gZip) { throw "Goreman windows_amd64.zip asset not found." }
@@ -46,11 +54,11 @@ jobs:
           if (-not $gExe) { throw "goreman.exe not found inside the zip." }
           Copy-Item $gExe.FullName "C:\tools\goreman\goreman.exe" -Force
 
-      - name: Install Rclone
+      - name: Install Rclone (machine-wide)
         run: |
           winget source update
-          winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent
-          echo "$env:LOCALAPPDATA\Microsoft\WinGet\Links" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent --scope machine
+          rclone version
 
       - name: Configure Rclone remote (Cloudflare R2)
         env:
@@ -58,8 +66,15 @@ jobs:
           CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
           CF_R2_ACCESS_KEY_SECRET: ${{ secrets.CF_R2_ACCESS_KEY_SECRET }}
         run: |
-          rclone config create persist s3 provider Cloudflare access_key_id "$env:CF_R2_ACCESS_KEY_ID" secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" region auto endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" --non-interactive
-          rclone config show persist | Out-Null
+          New-Item -ItemType Directory -Force -Path "C:\tools\rclone" | Out-Null
+          rclone config create persist s3 `
+            provider Cloudflare `
+            access_key_id "$env:CF_R2_ACCESS_KEY_ID" `
+            secret_access_key "$env:CF_R2_ACCESS_KEY_SECRET" `
+            region auto `
+            endpoint "https://$env:CF_R2_ACCOUNT_ID.r2.cloudflarestorage.com" `
+            --non-interactive --config "$env:RCLONE_CONFIG"
+          rclone config show persist --config "$env:RCLONE_CONFIG" | Out-Null
 
       - name: Install WinFsp for Rclone mounting
         run: |
@@ -74,36 +89,46 @@ jobs:
         run: |
           $mountDir = "C:\tools\rclone-mount"
           New-Item -ItemType Directory -Force -Path "$mountDir\cache", "C:\persist" | Out-Null
-          $rcloneConfig = rclone config file | Out-String | ForEach-Object { $_.Trim() }
+
           $remotePath = "persist:$($env:CF_R2_BUCKET)"
-          if ($env:PERSIST_PREFIX) {
-            $remotePath = "$remotePath/$($env:PERSIST_PREFIX)"
-          }
-          $rcloneArguments = "mount `"$remotePath`" C:\persist --config `"$rcloneConfig`" --vfs-cache-mode full --dir-cache-time 5m --cache-dir `"$mountDir\cache`" --file-perms 0777 --network-mode --no-console --log-level INFO --log-file `"$mountDir\mount.log`""
+          if ($env:PERSIST_PREFIX) { $remotePath = "$remotePath/$($env:PERSIST_PREFIX)" }
+
+          $globalRcloneConf = $env:RCLONE_CONFIG
+          $rcloneExe = (Get-Command rclone.exe -ErrorAction Stop).Source
+
+          $rcloneArguments = "mount `"$remotePath`" C:\persist --config `"$globalRcloneConf`" --vfs-cache-mode full --dir-cache-time 5m --cache-dir `"$mountDir\cache`" --network-mode --no-console --log-level INFO --log-file `"$mountDir\mount.log`""
           Write-Host "Generated Rclone Arguments: $rcloneArguments"
+
           $winswConfig = @"
           <service>
             <id>rclone-persist-mount</id>
             <name>Rclone Persist Mount (R2 Daemon)</name>
             <description>Background daemon mounting Cloudflare R2 at C:\persist</description>
-            <executable>rclone.exe</executable>
+            <executable>$rcloneExe</executable>
             <arguments>$rcloneArguments</arguments>
-            <log mode="append"><logpath>$mountDir</logpath></log>
-            <onfailure action="restart" delay="10 sec"/>
             <startmode>Automatic</startmode>
             <workingdirectory>$mountDir</workingdirectory>
+            <onfailure action="restart" delay="10 sec" />
+            <log>
+              <mode>append</mode>
+              <outpath>$mountDir</outpath>
+              <errpath>$mountDir</errpath>
+            </log>
           </service>
           "@
           $winswConfig | Out-File -FilePath "$mountDir\rclone-persist-mount.xml" -Encoding utf8 -Force
           Copy-Item "C:\tools\winsw\winsw.exe" "$mountDir\rclone-persist-mount.exe" -Force
+
           & "$mountDir\rclone-persist-mount.exe" install
           & "$mountDir\rclone-persist-mount.exe" start
           Write-Host "Waiting 10 seconds for the Rclone service to initialize..."
           Start-Sleep -Seconds 10
+
           $service = Get-Service -Name "rclone-persist-mount" -ErrorAction SilentlyContinue
-          if ($service.Status -ne "Running") {
+          if (-not $service -or $service.Status -ne "Running") {
             Write-Host "Service failed. Dumping logs for debugging:"
             Get-Content "$mountDir\rclone-persist-mount.err.log" -ErrorAction SilentlyContinue
+            Get-Content "$mountDir\rclone-persist-mount.out.log" -ErrorAction SilentlyContinue
             Get-Content "$mountDir\mount.log" -ErrorAction SilentlyContinue
             Write-Error "Failed to start Rclone mount service"
             exit 1
@@ -127,18 +152,28 @@ jobs:
           if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Set MTU 1400 on Tailscale and verify
+      - name: Set MTU 1400 on Tailscale and verify (wildcard alias)
+        shell: pwsh
         run: |
-          $iface = Get-NetIPInterface -InterfaceAlias "Tailscale" -ErrorAction SilentlyContinue
-          if (-not $iface) { Write-Error "Interface 'Tailscale' not found."; exit 1 }
-          netsh interface ipv4 set subinterface "Tailscale" mtu=1400 store=persistent > $null 2>&1
-          netsh interface ipv6 set subinterface "Tailscale" mtu=1400 store=persistent > $null 2>&1
-          $v4 = Get-NetIPInterface -InterfaceAlias "Tailscale" -AddressFamily IPv4
-          $v6 = Get-NetIPInterface -InterfaceAlias "Tailscale" -AddressFamily IPv6
-          Write-Host "Tailscale MTU IPv4: $($v4.NlMtu)"
-          Write-Host "Tailscale MTU IPv6: $($v6.NlMtu)"
-          if ($v4.NlMtu -ne 1400 -or $v6.NlMtu -ne 1400) { Write-Error "Unable to set MTU=1400 on 'Tailscale'."; exit 1 }
-          Write-Host "MTU successfully set to 1400 on 'Tailscale' (IPv4 and IPv6)."
+          $ifaceV4 = Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -like "Tailscale*" } | Select-Object -First 1
+          $ifaceV6 = Get-NetIPInterface -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -like "Tailscale*" } | Select-Object -First 1
+          if (-not $ifaceV4 -and -not $ifaceV6) { Write-Error "Interface 'Tailscale*' not found."; exit 1 }
+
+          $alias = if ($ifaceV4) { $ifaceV4.InterfaceAlias } else { $ifaceV6.InterfaceAlias }
+
+          netsh interface ipv4 set subinterface "$alias" mtu=1400 store=persistent > $null 2>&1
+          netsh interface ipv6 set subinterface "$alias" mtu=1400 store=persistent > $null 2>&1
+
+          $v4 = Get-NetIPInterface -InterfaceAlias "$alias" -AddressFamily IPv4 -ErrorAction SilentlyContinue
+          $v6 = Get-NetIPInterface -InterfaceAlias "$alias" -AddressFamily IPv6 -ErrorAction SilentlyContinue
+          Write-Host "Tailscale MTU IPv4 ($alias): $((if($v4){$v4.NlMtu}else{'N/A'}))"
+          Write-Host "Tailscale MTU IPv6 ($alias): $((if($v6){$v6.NlMtu}else{'N/A'}))"
+
+          $ok = $true
+          if ($v4 -and $v4.NlMtu -ne 1400) { $ok = $false }
+          if ($v6 -and $v6.NlMtu -ne 1400) { $ok = $false }
+          if (-not $ok) { Write-Error "Unable to set MTU=1400 on '$alias'."; exit 1 }
+          Write-Host "MTU successfully set to 1400 on '$alias'."
 
       - name: Create local user (${{ env.RDP_USER }})
         env:
