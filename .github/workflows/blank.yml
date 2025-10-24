@@ -61,22 +61,23 @@ jobs:
           winget source update
           winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
-          # Resolve absolute path (PATH changes from winget won't apply to this shell)
-          $candidates = @(
-            "C:\Program Files\rclone\rclone.exe",
-            "C:\Program Files (x86)\rclone\rclone.exe"
-          )
-          $rcloneExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $rcloneExe) {
-            $found = Get-ChildItem -Path "C:\Program Files","C:\Program Files (x86)" -Recurse -Filter "rclone.exe" -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match "\\rclone\\rclone\.exe$" } | Select-Object -ExpandProperty FullName -First 1
-            if ($found) { $rcloneExe = $found }
-          }
+          # Prefer the machine-scope WinGet shim; then typical install dirs; last-resort the user-scope shim.
+          $linkMachine = Join-Path $env:ProgramFiles "WinGet\Links\rclone.exe"
+          $progFiles   = "C:\Program Files\rclone\rclone.exe"
+          $progFiles86 = "C:\Program Files (x86)\rclone\rclone.exe"
+          $linkUser    = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\rclone.exe"
+
+          $rcloneExe = @($linkMachine, $progFiles, $progFiles86, $linkUser) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $rcloneExe) { throw "rclone.exe not found after installation." }
 
-          # Use absolute path now, and add directory to PATH for subsequent steps
-          & $rcloneExe version
-          (Split-Path $rcloneExe) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # Use absolute path now
+          & $rcloneExe version | Write-Host
+
+          # Make rclone available to subsequent steps
+          $pathsToAdd = @((Split-Path $rcloneExe))
+          if (Test-Path $linkMachine) { $pathsToAdd += (Split-Path $linkMachine) }
+          $pathsToAdd = $pathsToAdd | Select-Object -Unique
+          $pathsToAdd | ForEach-Object { $_ | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append }
 
       - name: Configure Rclone remote (Cloudflare R2)
         env:
@@ -113,17 +114,23 @@ jobs:
 
           $globalRcloneConf = $env:RCLONE_CONFIG
 
-          # Resolve absolute rclone.exe path (PATH is already updated via GITHUB_PATH, but keep fallback)
-          $rcloneCmd = Get-Command rclone.exe -ErrorAction SilentlyContinue
-          if ($rcloneCmd) { $rcloneExe = $rcloneCmd.Source }
-          elseif (Test-Path "C:\Program Files\rclone\rclone.exe") { $rcloneExe = "C:\Program Files\rclone\rclone.exe" }
-          elseif (Test-Path "C:\Program Files (x86)\rclone\rclone.exe") { $rcloneExe = "C:\Program Files (x86)\rclone\rclone.exe" }
-          else { throw "rclone.exe not found." }
+          # Prefer a machine-visible path for the service
+          $linkMachine = Join-Path $env:ProgramFiles "WinGet\Links\rclone.exe"
+          $progFiles   = "C:\Program Files\rclone\rclone.exe"
+          $progFiles86 = "C:\Program Files (x86)\rclone\rclone.exe"
+          $rcloneExe = @($linkMachine, $progFiles, $progFiles86) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $rcloneExe) {
+            # Fallback to whatever PowerShell resolves, but this may be user-scope only
+            $cmd = Get-Command rclone.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $rcloneExe = $cmd.Source }
+          }
+          if (-not $rcloneExe) { throw "rclone.exe not found in a machine-visible location." }
 
           $rcloneArguments = "mount `"$remotePath`" C:\persist --config `"$globalRcloneConf`" --vfs-cache-mode full --dir-cache-time 5m --cache-dir `"$mountDir\cache`" --network-mode --no-console --log-level INFO --log-file `"$mountDir\mount.log`""
           Write-Host "Generated Rclone Arguments: $rcloneArguments"
 
-          # WinSW v2-compatible config
+          # WinSW v2 config
           $winswConfig = @"
           <service>
             <id>rclone-persist-mount</id>
