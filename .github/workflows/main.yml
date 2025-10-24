@@ -28,17 +28,18 @@ jobs:
           winget source update
           winget install --id=Microsoft.OpenJDK.21 -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
-      - name: Install tools (WinSW + Goreman)
+      - name: Install tools (WinSW v2 + Goreman)
         shell: pwsh
         run: |
           $ua = @{ "User-Agent"="curl/8.0" }
           New-Item -ItemType Directory -Force -Path "C:\tools\winsw","C:\tools\goreman","C:\persist\orchestrator" | Out-Null
 
-          # WinSW latest but ensure major v3
-          $winswRel   = Invoke-RestMethod -Uri "https://api.github.com/repos/winsw/winsw/releases/latest" -Headers $ua
-          if ($winswRel.tag_name -notmatch '^v3\.') { throw "Expected WinSW v3.x release, got $($winswRel.tag_name)." }
+          # WinSW v2.x (pick latest v2 release)
+          $winswReleases = Invoke-RestMethod -Uri "https://api.github.com/repos/winsw/winsw/releases" -Headers $ua
+          $winswRel = $winswReleases | Where-Object { $_.tag_name -match '^v2\.' } | Select-Object -First 1
+          if (-not $winswRel) { throw "WinSW v2.x release not found." }
           $winswAsset = $winswRel.assets | Where-Object { $_.name -match "(?i)winsw.*x64\.exe$" } | Select-Object -First 1
-          if (-not $winswAsset) { throw "WinSW x64 asset not found." }
+          if (-not $winswAsset) { throw "WinSW v2 x64 asset not found." }
           Invoke-WebRequest -Uri $winswAsset.browser_download_url -OutFile "C:\tools\winsw\winsw.exe"
 
           # Goreman latest windows_amd64
@@ -55,9 +56,17 @@ jobs:
           Copy-Item $gExe.FullName "C:\tools\goreman\goreman.exe" -Force
 
       - name: Install Rclone (machine-wide)
+        shell: pwsh
         run: |
           winget source update
           winget install --id=Rclone.Rclone -e --accept-package-agreements --accept-source-agreements --silent --scope machine
+          # Ensure rclone is in PATH for subsequent steps
+          $cmd = Get-Command rclone.exe -ErrorAction SilentlyContinue
+          if ($cmd) {
+            (Split-Path $cmd.Source) | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          } elseif (Test-Path "C:\Program Files\rclone\rclone.exe") {
+            "C:\Program Files\rclone" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
           rclone version
 
       - name: Configure Rclone remote (Cloudflare R2)
@@ -81,7 +90,7 @@ jobs:
           winget source update
           winget install --id=WinFsp.WinFsp -e --accept-package-agreements --accept-source-agreements --silent --scope machine
 
-      - name: Set up Rclone mount as a background daemon service
+      - name: Set up Rclone mount as a background daemon service (WinSW v2)
         env:
           CF_R2_BUCKET: ${{ secrets.CF_R2_BUCKET }}
           PERSIST_PREFIX: ${{ secrets.PERSIST_PREFIX }}
@@ -94,11 +103,17 @@ jobs:
           if ($env:PERSIST_PREFIX) { $remotePath = "$remotePath/$($env:PERSIST_PREFIX)" }
 
           $globalRcloneConf = $env:RCLONE_CONFIG
-          $rcloneExe = (Get-Command rclone.exe -ErrorAction Stop).Source
+
+          # Resolve absolute rclone.exe path (fallback to typical location)
+          $rcloneCmd = Get-Command rclone.exe -ErrorAction SilentlyContinue
+          if ($rcloneCmd) { $rcloneExe = $rcloneCmd.Source }
+          elseif (Test-Path "C:\Program Files\rclone\rclone.exe") { $rcloneExe = "C:\Program Files\rclone\rclone.exe" }
+          else { throw "rclone.exe not found in PATH or default location." }
 
           $rcloneArguments = "mount `"$remotePath`" C:\persist --config `"$globalRcloneConf`" --vfs-cache-mode full --dir-cache-time 5m --cache-dir `"$mountDir\cache`" --network-mode --no-console --log-level INFO --log-file `"$mountDir\mount.log`""
           Write-Host "Generated Rclone Arguments: $rcloneArguments"
 
+          # WinSW v2-compatible config: use <logpath> and <log mode="..."/>
           $winswConfig = @"
           <service>
             <id>rclone-persist-mount</id>
@@ -109,11 +124,8 @@ jobs:
             <startmode>Automatic</startmode>
             <workingdirectory>$mountDir</workingdirectory>
             <onfailure action="restart" delay="10 sec" />
-            <log>
-              <mode>append</mode>
-              <outpath>$mountDir</outpath>
-              <errpath>$mountDir</errpath>
-            </log>
+            <logpath>$mountDir</logpath>
+            <log mode="append" />
           </service>
           "@
           $winswConfig | Out-File -FilePath "$mountDir\rclone-persist-mount.xml" -Encoding utf8 -Force
