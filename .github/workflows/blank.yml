@@ -1,4 +1,4 @@
-name: CI
+name: RDP
 
 on:
   workflow_dispatch:
@@ -228,7 +228,7 @@ jobs:
           $lnk2.WindowStyle = 7
           $lnk2.Save()
 
-      - name: Prime and keep active the ${{ env:RDP_USER }} session
+      - name: Prime and keep active the ${{ env.RDP_USER }} session
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
