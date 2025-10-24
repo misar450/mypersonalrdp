@@ -193,28 +193,18 @@ jobs:
           if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Set MTU 1400 on Tailscale and verify (wildcard alias)
-        shell: pwsh
+      - name: Set MTU 1400 on Tailscale and verify
         run: |
-          $ifaceV4 = Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -like "Tailscale*" } | Select-Object -First 1
-          $ifaceV6 = Get-NetIPInterface -AddressFamily IPv6 -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -like "Tailscale*" } | Select-Object -First 1
-          if (-not $ifaceV4 -and -not $ifaceV6) { Write-Error "Interface 'Tailscale*' not found."; exit 1 }
-
-          $alias = if ($ifaceV4) { $ifaceV4.InterfaceAlias } else { $ifaceV6.InterfaceAlias }
-
-          netsh interface ipv4 set subinterface "$alias" mtu=1400 store=persistent > $null 2>&1
-          netsh interface ipv6 set subinterface "$alias" mtu=1400 store=persistent > $null 2>&1
-
-          $v4 = Get-NetIPInterface -InterfaceAlias "$alias" -AddressFamily IPv4 -ErrorAction SilentlyContinue
-          $v6 = Get-NetIPInterface -InterfaceAlias "$alias" -AddressFamily IPv6 -ErrorAction SilentlyContinue
-          Write-Host "Tailscale MTU IPv4 ($alias): $((if($v4){$v4.NlMtu}else{'N/A'}))"
-          Write-Host "Tailscale MTU IPv6 ($alias): $((if($v6){$v6.NlMtu}else{'N/A'}))"
-
-          $ok = $true
-          if ($v4 -and $v4.NlMtu -ne 1400) { $ok = $false }
-          if ($v6 -and $v6.NlMtu -ne 1400) { $ok = $false }
-          if (-not $ok) { Write-Error "Unable to set MTU=1400 on '$alias'."; exit 1 }
-          Write-Host "MTU successfully set to 1400 on '$alias'."
+          $iface = Get-NetIPInterface -InterfaceAlias "Tailscale" -ErrorAction SilentlyContinue
+          if (-not $iface) { Write-Error "Interface 'Tailscale' not found."; exit 1 }
+          netsh interface ipv4 set subinterface "Tailscale" mtu=1400 store=persistent > $null 2>&1
+          netsh interface ipv6 set subinterface "Tailscale" mtu=1400 store=persistent > $null 2>&1
+          $v4 = Get-NetIPInterface -InterfaceAlias "Tailscale" -AddressFamily IPv4
+          $v6 = Get-NetIPInterface -InterfaceAlias "Tailscale" -AddressFamily IPv6
+          Write-Host "Tailscale MTU IPv4: $($v4.NlMtu)"
+          Write-Host "Tailscale MTU IPv6: $($v6.NlMtu)"
+          if ($v4.NlMtu -ne 1400 -or $v6.NlMtu -ne 1400) { Write-Error "Unable to set MTU=1400 on 'Tailscale'."; exit 1 }
+          Write-Host "MTU successfully set to 1400 on 'Tailscale' (IPv4 and IPv6)."
 
       - name: "Create local user (${{ env.RDP_USER }})"
         env:
